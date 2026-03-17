@@ -1,0 +1,64 @@
+# ----------------------------
+# Web framework and extensions
+# ----------------------------
+Flask[async]==3.0.3
+Werkzeug==3.0.3
+Flask-Cors==4.0.1
+Flask-Session==0.6.0
+Flask-SQLAlchemy==3.1.1
+
+# ----------------------------
+# Server
+# ----------------------------
+gunicorn==23.0.0
+
+# ----------------------------
+# Databases
+# ----------------------------
+SQLAlchemy==2.0.35
+psycopg[binary]>=3.2
+psycopg2-binary==2.9.9
+
+# ----------------------------
+# Cloud / External APIs / AI
+# ----------------------------
+boto3>=1.35.21
+sendgrid>=6.11.0
+openai>=1.12.0
+google-genai>=1.13.0
+google-generativeai>=0.8.6
+
+# ----------------------------
+# Utilities & Common libs
+# ----------------------------
+requests==2.32.3
+Pillow>=9.5.0
+email-validator==2.2.0
+python-dotenv==1.0.1
+cryptography==43.0.1
+itsdangerous==2.2.0
+pydantic>=2.8.0
+Jinja2==3.1.4
+pycountry>=24.6.1
+PyJWT>=2.8.0
+pypdf>=4.0.0
+httpx>=0.28.1,<1.0.0
+
+# ----------------------------
+# Background job scheduler
+# ----------------------------
+APScheduler>=3.10.0
+
+# Timezone support
+pytz>=2023.3
+
+# Google Sheets (for drip campaigns)
+google-auth>=2.43.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+google-api-python-client>=2.149.0
+gspread>=6.0.0
+
+# RAG / Knowledge Base
+qdrant-client>=1.16.2
+tenacity>=8.2.3

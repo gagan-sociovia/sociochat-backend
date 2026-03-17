@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+instance/
+knowledge_base/
+*.db
+.git/
+.gitignore
+*.md

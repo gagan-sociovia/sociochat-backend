@@ -1,0 +1,16 @@
+﻿python : INFO:notifications:[notifications] PostgreSQL 
+LISTEN/NOTIFY mode ready
+At line:1 char:1
++ python check_templates.py > templates_output.txt 2>&1
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (INFO:notificati...TI 
+   FY mode ready:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Traceback (most recent call last):
+  File 
+"C:\Users\prabh\Downloads\sociochat\backend\check_templates.py", 
+line 8, in <module>
+    from app import create_app, db
+ImportError: cannot import name 'create_app' from 'app' 
+(C:\Users\prabh\Downloads\sociochat\backend\app.py)

@@ -1,0 +1,10 @@
+Hi {{ name }},
+
+Welcome to SocioChat! Please use the following verification code to activate your account.
+
+Registration Code: {{ code }}
+
+If you didn't request this, you can safely ignore this email.
+
+Thanks,
+The SocioChat Team
