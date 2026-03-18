@@ -38,6 +38,10 @@ from .production_trigger_routes import production_trigger_bp
 from .drip_routes import drip_bp
 from .template_routes import template_bp
 from .interactive_automation_routes import interactive_automation_bp
+from .flow_routes import flow_bp
+from .flow_testing import flow_testing_bp
+from .flow_endpoint import flow_endpoint_bp
+from .dataset_routes import dataset_bp
 from .models import (
     WhatsAppAccount,
     WhatsAppConversation,
@@ -78,6 +82,10 @@ __all__ = [
     "interactive_automation_bp",
     "bulk_bp",
     "production_trigger_bp",
+    "flow_bp",
+    "flow_testing_bp",
+    "flow_endpoint_bp",
+    "dataset_bp",
     "coexistence_bp",
     "WhatsAppAccount",
     "WhatsAppConversation",

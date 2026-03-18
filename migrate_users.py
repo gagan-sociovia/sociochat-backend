@@ -29,8 +29,15 @@ migrations = [
     ("phone_otp_expires_at", "ALTER TABLE users ADD COLUMN phone_otp_expires_at TIMESTAMP"),
     ("phone_last_sent_at", "ALTER TABLE users ADD COLUMN phone_last_sent_at TIMESTAMP"),
     ("phone_verified", "ALTER TABLE users ADD COLUMN phone_verified BOOLEAN DEFAULT FALSE"),
+    ("auto_login_token_hash", "ALTER TABLE users ADD COLUMN auto_login_token_hash VARCHAR(256)"),
+    ("auto_login_token_fingerprint", "ALTER TABLE users ADD COLUMN auto_login_token_fingerprint VARCHAR(64)"),
+    ("auto_login_token_expires_at", "ALTER TABLE users ADD COLUMN auto_login_token_expires_at TIMESTAMP"),
+    ("email_verified_at", "ALTER TABLE users ADD COLUMN email_verified_at TIMESTAMP"),
+    ("phone_verified_at", "ALTER TABLE users ADD COLUMN phone_verified_at TIMESTAMP"),
     ("rejection_reason", "ALTER TABLE users ADD COLUMN rejection_reason TEXT"),
     ("email_verified", "ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT FALSE"),
+    ("pending_plan", "ALTER TABLE users ADD COLUMN pending_plan VARCHAR(32)"),
+    ("pending_billing", "ALTER TABLE users ADD COLUMN pending_billing VARCHAR(32)"),
     ("updated_at", "ALTER TABLE users ADD COLUMN updated_at TIMESTAMP"),
 ]
 
@@ -45,6 +52,21 @@ for col_name, sql in migrations:
             added += 1
         except Exception as e:
             print(f"  ERROR {col_name}: {e}")
+
+# Ensure expected auth indexes exist
+index_migrations = [
+    (
+        "ix_users_auto_login_token_fingerprint",
+        "CREATE INDEX IF NOT EXISTS ix_users_auto_login_token_fingerprint ON users (auto_login_token_fingerprint)"
+    ),
+]
+
+for index_name, sql in index_migrations:
+    try:
+        cur.execute(sql)
+        print(f"  INDEX OK: {index_name}")
+    except Exception as e:
+        print(f"  INDEX ERROR {index_name}: {e}")
 
 # Also ensure workspaces2 table exists
 cur.execute("SELECT to_regclass('public.workspaces2')")
@@ -68,6 +90,42 @@ if cur.fetchone()[0] is None:
 else:
     print("\n  SKIP: workspaces2 table already exists")
 
+# Ensure workspaces2 has all columns expected by the current Workspace model
+cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'workspaces2' ORDER BY ordinal_position")
+existing_workspaces = [row[0] for row in cur.fetchall()]
+print(f"Existing workspaces2 columns ({len(existing_workspaces)}): {existing_workspaces}")
+
+workspace_migrations = [
+    ("registered_address", "ALTER TABLE workspaces2 ADD COLUMN registered_address VARCHAR(500)"),
+    ("address_line", "ALTER TABLE workspaces2 ADD COLUMN address_line VARCHAR(500)"),
+    ("city", "ALTER TABLE workspaces2 ADD COLUMN city VARCHAR(100)"),
+    ("district", "ALTER TABLE workspaces2 ADD COLUMN district VARCHAR(100)"),
+    ("pin_code", "ALTER TABLE workspaces2 ADD COLUMN pin_code VARCHAR(20)"),
+    ("country", "ALTER TABLE workspaces2 ADD COLUMN country VARCHAR(100) DEFAULT 'India'"),
+    ("b2b_b2c", "ALTER TABLE workspaces2 ADD COLUMN b2b_b2c VARCHAR(20)"),
+    ("audience_description", "ALTER TABLE workspaces2 ADD COLUMN audience_description TEXT"),
+    ("competitor_direct_1", "ALTER TABLE workspaces2 ADD COLUMN competitor_direct_1 VARCHAR(255)"),
+    ("competitor_direct_2", "ALTER TABLE workspaces2 ADD COLUMN competitor_direct_2 VARCHAR(255)"),
+    ("competitor_indirect_1", "ALTER TABLE workspaces2 ADD COLUMN competitor_indirect_1 VARCHAR(255)"),
+    ("competitor_indirect_2", "ALTER TABLE workspaces2 ADD COLUMN competitor_indirect_2 VARCHAR(255)"),
+    ("social_links", "ALTER TABLE workspaces2 ADD COLUMN social_links TEXT"),
+    ("usp", "ALTER TABLE workspaces2 ADD COLUMN usp TEXT"),
+    ("creatives_path", "ALTER TABLE workspaces2 ADD COLUMN creatives_path VARCHAR(500)"),
+    ("remarks", "ALTER TABLE workspaces2 ADD COLUMN remarks TEXT"),
+]
+
+workspace_added = 0
+for col_name, sql in workspace_migrations:
+    if col_name in existing_workspaces:
+        print(f"  WORKSPACE SKIP (exists): {col_name}")
+    else:
+        try:
+            cur.execute(sql)
+            print(f"  WORKSPACE ADDED: {col_name}")
+            workspace_added += 1
+        except Exception as e:
+            print(f"  WORKSPACE ERROR {col_name}: {e}")
+
 # Also ensure audit_logs table exists
 cur.execute("SELECT to_regclass('public.audit_logs')")
 if cur.fetchone()[0] is None:
@@ -90,7 +148,10 @@ else:
 cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'users' ORDER BY ordinal_position")
 final = [row[0] for row in cur.fetchall()]
 print(f"\nFinal columns ({len(final)}): {final}")
-print(f"\nMigration complete! Added {added} columns.")
+cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'workspaces2' ORDER BY ordinal_position")
+final_workspaces = [row[0] for row in cur.fetchall()]
+print(f"Final workspaces2 columns ({len(final_workspaces)}): {final_workspaces}")
+print(f"\nMigration complete! Added {added} user columns and {workspace_added} workspace columns.")
 
 cur.close()
 conn.close()

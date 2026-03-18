@@ -17,7 +17,8 @@ gunicorn==23.0.0
 # ----------------------------
 SQLAlchemy==2.0.35
 psycopg[binary]>=3.2
-psycopg2-binary==2.9.9
+# 2.9.10+ provides CPython 3.13 wheels, which avoids a local source build on Windows.
+psycopg2-binary==2.9.11
 
 # ----------------------------
 # Cloud / External APIs / AI
