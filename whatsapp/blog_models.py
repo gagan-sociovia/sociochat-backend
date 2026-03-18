@@ -7,7 +7,7 @@ Stores blog posts with block-based content as JSONB.
 """
 
 from datetime import datetime
-from sqlalchemy import JSON as JSONB  # Use generic JSON for SQLite compatibility
+from sqlalchemy.dialects.postgresql import JSONB
 from models import db, User, Workspace
 
 

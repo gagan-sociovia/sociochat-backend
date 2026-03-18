@@ -9,8 +9,9 @@ import os
 import hmac
 import hashlib
 import logging
+import requests
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,185 @@ def normalize_phone(phone: str) -> str:
     if len(digits) == 10 and digits[0] in "6789":
         digits = "91" + digits
     return digits
+
+
+def normalize_phone_robust(raw) -> Optional[str]:
+    """
+    Production-grade phone normalizer using Google's phonenumbers library.
+
+    Handles every messy CRM edge case:
+    - Multi-number fields: "8527727496, 9999346509" → "918527727496"
+    - Concatenated with +: "+277780336483+919650044539" → "277780336483"
+    - Scientific notation from Excel: "9.19E+11" → "919000000000"
+    - International: "+1 650 555 1234" → "16505551234"
+    - Indian bare: "9876543210" → "919876543210"
+    - Leading zero: "09876543210" → "919876543210"
+    - Spaces/dashes/parens: "+91 (987) 654-3210" → "919876543210"
+
+    Returns:
+        First valid phone as digits-only E.164 (no +), or None if invalid.
+    """
+    import re
+
+    DEFAULT_COUNTRY = "IN"
+
+    if raw is None:
+        return None
+
+    raw_str = str(raw).strip()
+    if not raw_str:
+        return None
+
+    # Handle scientific notation safely (e.g. 9.19E+11 from Excel)
+    if "E+" in raw_str.upper() or "E-" in raw_str.upper():
+        try:
+            raw_str = format(float(raw_str), ".0f")
+        except (ValueError, OverflowError):
+            pass
+
+    # Handle float with decimal (e.g. "9390000000.0")
+    if isinstance(raw, float):
+        raw_str = format(raw, ".0f")
+    elif "." in raw_str:
+        try:
+            raw_str = format(float(raw_str), ".0f")
+        except (ValueError, OverflowError):
+            pass
+
+    # Split embedded + signs BEFORE other splitting
+    # "+277780336483+919650044539" → ["+277780336483", "+919650044539"]
+    if raw_str.count("+") > 1:
+        # Split on + but keep the + as prefix for each part
+        plus_parts = []
+        for segment in raw_str.split("+"):
+            segment = segment.strip()
+            if segment:
+                plus_parts.append("+" + segment)
+        if plus_parts:
+            raw_str = ",".join(plus_parts)
+
+    # Split multi-number fields on common separators
+    parts = re.split(r"[,;/\|&\n\t]+|\bor\b|\band\b", raw_str)
+
+    try:
+        import phonenumbers
+        _has_phonenumbers = True
+    except ImportError:
+        _has_phonenumbers = False
+        logger.warning("phonenumbers library not installed, falling back to basic normalization")
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if _has_phonenumbers:
+            try:
+                num = phonenumbers.parse(part, DEFAULT_COUNTRY)
+                if phonenumbers.is_possible_number(num):
+                    e164 = phonenumbers.format_number(
+                        num, phonenumbers.PhoneNumberFormat.E164
+                    )
+                    return e164.replace("+", "")  # Strip + for WhatsApp API
+            except phonenumbers.NumberParseException:
+                continue
+            except Exception:
+                continue
+        else:
+            # Fallback: basic normalization (same as normalize_phone)
+            digits = "".join(ch for ch in part if ch.isdigit())
+            if not digits:
+                continue
+            digits = digits.lstrip("0") or "0"
+            if len(digits) == 10 and digits[0] in "6789":
+                digits = "91" + digits
+            if 10 <= len(digits) <= 15:
+                return digits
+
+    # None of the parts parsed to a valid number
+    logger.warning(f"Invalid phone — no valid number found in: {repr(raw)}")
+    return None
+
+
+def extract_all_phones(raw) -> list:
+    """
+    Extract ALL valid phone numbers from a multi-number field.
+
+    Useful for CRM cleaning, deduplication, and future multi-recipient features.
+
+    Args:
+        raw: Raw phone value (str, float, int, or None)
+
+    Returns:
+        List of valid E.164 phone numbers (digits only, no +)
+    """
+    import re
+
+    DEFAULT_COUNTRY = "IN"
+
+    if raw is None:
+        return []
+
+    raw_str = str(raw).strip()
+    if not raw_str:
+        return []
+
+    # Handle scientific notation
+    if "E+" in raw_str.upper() or "E-" in raw_str.upper():
+        try:
+            raw_str = format(float(raw_str), ".0f")
+        except (ValueError, OverflowError):
+            pass
+
+    if isinstance(raw, float):
+        raw_str = format(raw, ".0f")
+
+    # Split embedded + signs
+    if raw_str.count("+") > 1:
+        plus_parts = []
+        for segment in raw_str.split("+"):
+            segment = segment.strip()
+            if segment:
+                plus_parts.append("+" + segment)
+        if plus_parts:
+            raw_str = ",".join(plus_parts)
+
+    parts = re.split(r"[,;/\|&\n\t]+|\bor\b|\band\b", raw_str)
+    phones = []
+
+    try:
+        import phonenumbers
+        _has_phonenumbers = True
+    except ImportError:
+        _has_phonenumbers = False
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if _has_phonenumbers:
+            try:
+                num = phonenumbers.parse(part, DEFAULT_COUNTRY)
+                if phonenumbers.is_possible_number(num):
+                    e164 = phonenumbers.format_number(
+                        num, phonenumbers.PhoneNumberFormat.E164
+                    ).replace("+", "")
+                    if e164 not in phones:
+                        phones.append(e164)
+            except Exception:
+                continue
+        else:
+            digits = "".join(ch for ch in part if ch.isdigit())
+            if not digits:
+                continue
+            digits = digits.lstrip("0") or "0"
+            if len(digits) == 10 and digits[0] in "6789":
+                digits = "91" + digits
+            if 10 <= len(digits) <= 15 and digits not in phones:
+                phones.append(digits)
+
+    return phones
 
 
 def format_phone_display(phone: str) -> str:
@@ -281,18 +461,6 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def ensure_tz_aware(dt: Optional[datetime]) -> Optional[datetime]:
-    """
-    Ensure a datetime object is timezone-aware (UTC).
-    If naive, replaces tzinfo with UTC.
-    """
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
 # ============================================================
 # Response Helpers
 # ============================================================
@@ -413,3 +581,67 @@ def clear_dedup_cache():
     """Clear the deduplication cache (for testing)."""
     global _processed_wamids
     _processed_wamids = set()
+
+
+# ============================================================
+# Webhook Subscription Helpers
+# ============================================================
+
+def subscribe_waba_to_app(waba_id: str, access_token: str) -> dict:
+    """
+    Subscribe WABA to Sociovia's Meta App for webhook events.
+    This is critical for receiving messages, statuses, echoes, and template updates.
+    
+    Fields subscribed:
+    - messages: Inbound messages from users
+    - message_template_status_update: Template approval/rejection/re-approval
+    - message_template_quality_update: Template quality score changes
+    - template_category_update: Template category shifts by Meta
+    - message_echoes: Messages sent from other devices (for coexistence)
+    - smb_message_echoes: Messages sent from mobile in coexistence mode (SMB specific)
+    
+    Args:
+        waba_id: WhatsApp Business Account ID
+        access_token: Meta access token with business_management scope
+        
+    Returns:
+        Dict with success status and message/error
+    """
+    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    meta_graph = f"https://graph.facebook.com/{api_version}"
+    
+    subscribed_fields = [
+        "messages",
+        "message_template_status_update",
+        "message_template_quality_update",
+        "template_category_update",
+        "message_echoes",
+        "smb_message_echoes",  # For coexistence mode echo messages
+    ]
+    
+    try:
+        logger.info(f"Subscribing WABA {waba_id} to app fields: {subscribed_fields}")
+        
+        resp = requests.post(
+            f"{meta_graph}/{waba_id}/subscribed_apps",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={"subscribed_fields": subscribed_fields},
+            timeout=20,
+        )
+        
+        result = resp.json()
+        
+        if resp.status_code == 200 and result.get("success"):
+            logger.info(f"✅ WABA {waba_id} subscribed to app successfully.")
+            return {"success": True, "message": "WABA subscribed to app successfully"}
+        else:
+            error_msg = result.get("error", {}).get("message") or str(result)
+            logger.warning(f"❌ WABA {waba_id} subscription failed: {error_msg}")
+            return {"success": False, "error": error_msg}
+            
+    except Exception as e:
+        logger.exception(f"Unexpected error subscribing WABA {waba_id}: {e}")
+        return {"success": False, "error": str(e)}

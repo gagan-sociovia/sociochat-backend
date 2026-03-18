@@ -12,7 +12,6 @@ Endpoints:
     DELETE /api/whatsapp/interactive-automations/<id>     → Delete automation
     POST   /api/whatsapp/interactive-automations/<id>/publish → Publish automation
     POST   /api/whatsapp/interactive-automations/<id>/pause   → Pause automation
-    GET    /api/whatsapp/interactive-automations/templates-with-buttons → List chainable templates
 """
 
 import logging
@@ -21,7 +20,7 @@ from functools import wraps
 from flask import Blueprint, request, jsonify, g
 from models import db
 from .visual_automation_models import WhatsAppVisualAutomation
-from .models import WhatsAppAccount, WhatsAppTemplate
+from .models import WhatsAppAccount
 
 logger = logging.getLogger(__name__)
 
@@ -362,76 +361,4 @@ def clear_conversation_states():
     except Exception as e:
         db.session.rollback()
         logger.error(f"Error clearing conversation states: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@interactive_automation_bp.route("/interactive-automations/templates-with-buttons", methods=["GET"])
-def list_templates_with_buttons():
-    """
-    List approved templates that have QUICK_REPLY buttons.
-    These templates are eligible for chaining in interactive automation flows.
-    
-    Query params:
-        - workspace_id: Required
-        - account_id: Required
-    """
-    try:
-        workspace_id = request.args.get("workspace_id")
-        account_id = request.args.get("account_id", type=int)
-        
-        if not workspace_id or not account_id:
-            return jsonify({"success": False, "error": "workspace_id and account_id are required"}), 400
-        
-        # Get all approved templates for this account
-        templates = WhatsAppTemplate.query.filter_by(
-            account_id=account_id,
-            status="APPROVED",
-        ).filter(
-            WhatsAppTemplate.is_archived == False
-        ).all()
-        
-        # Filter to templates with QUICK_REPLY buttons and extract button info
-        result = []
-        for tmpl in templates:
-            components = tmpl.components or []
-            quick_reply_buttons = []
-            
-            for comp in components:
-                if comp.get("type", "").upper() == "BUTTONS":
-                    for idx, btn in enumerate(comp.get("buttons", [])):
-                        if btn.get("type", "").upper() == "QUICK_REPLY":
-                            quick_reply_buttons.append({
-                                "index": idx,
-                                "text": btn.get("text", f"Button {idx + 1}"),
-                            })
-            
-            if not quick_reply_buttons:
-                continue
-            
-            # Extract header/body/footer for preview
-            header_text = tmpl.header_text
-            body_text = tmpl.body_text
-            footer_text = tmpl.footer_text
-            
-            result.append({
-                "id": tmpl.id,
-                "name": tmpl.name,
-                "category": tmpl.category,
-                "language": tmpl.language,
-                "status": tmpl.status,
-                "headerText": header_text,
-                "bodyText": body_text,
-                "footerText": footer_text,
-                "variableCount": tmpl.variable_count or 0,
-                "buttons": quick_reply_buttons,
-            })
-        
-        return jsonify({
-            "success": True,
-            "templates": result,
-            "total": len(result),
-        })
-        
-    except Exception as e:
-        logger.error(f"Error listing templates with buttons: {e}")
         return jsonify({"success": False, "error": str(e)}), 500

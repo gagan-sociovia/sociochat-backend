@@ -14,6 +14,7 @@ Endpoints:
 """
 
 import logging
+import os
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from sqlalchemy import func
@@ -23,7 +24,6 @@ from .models import WhatsAppTemplate, WhatsAppAccount
 from .services import WhatsAppService
 from .template_validator import validate_template, TemplateValidator, ApprovalPath
 from .template_rewriter import rewrite_template, RewriteMode
-from .utils import ensure_tz_aware
 from rate_limit.decorator import rate_limit
 
 logger = logging.getLogger(__name__)
@@ -82,8 +82,7 @@ def validate_template_endpoint():
         if account_id:
             account = WhatsAppAccount.query.get(account_id)
             if account and account.created_at:
-                created_at = ensure_tz_aware(account.created_at)
-                days_old = (datetime.now(timezone.utc) - created_at).days
+                days_old = (datetime.now(timezone.utc) - account.created_at).days
                 is_new_waba = days_old < 30
         
         # Validate
@@ -236,11 +235,7 @@ def create_template_endpoint():
                 buttons = comp.get("buttons", [])
         
         # Pre-validate
-        days_old = 0
-        if account.created_at:
-            created_at = ensure_tz_aware(account.created_at)
-            days_old = (datetime.now(timezone.utc) - created_at).days
-            
+        days_old = (datetime.now(timezone.utc) - account.created_at).days if account.created_at else 0
         is_new_waba = days_old < 30
         
         validator = TemplateValidator(is_new_waba=is_new_waba)
@@ -475,9 +470,25 @@ def upload_template_media():
         if file.filename == '':
             return jsonify({"error": "No selected file"}), 400
 
+        # Get account-specific access token
+        account_id = request.form.get('account_id')
+        access_token = None
+        if account_id:
+            try:
+                account = WhatsAppAccount.query.get(int(account_id))
+                if account:
+                    access_token = account.get_access_token()
+            except Exception:
+                logger.warning("Could not load account %s for media upload", account_id)
+
+        if not access_token:
+            access_token = os.getenv("WHATSAPP_ACCESS_TOKEN")
+
+        if not access_token:
+            return jsonify({"success": False, "error": "No access token available. Please reconnect your WhatsApp account."}), 400
+
         # Save to temp file strictly for upload processing
         import tempfile
-        import os
         from werkzeug.utils import secure_filename
         
         filename = secure_filename(file.filename)
@@ -493,9 +504,13 @@ def upload_template_media():
                 mime_type = 'application/octet-stream'
                 
             service = WhatsAppService()
-            # This returns the handle 'h'
-            handle = service.resumable_media_upload(temp_path, mime_type)
+            logger.info("Starting resumable upload: file=%s, mime=%s, account_id=%s, token_set=%s",
+                        filename, mime_type, account_id, bool(access_token))
+            handle = service.resumable_media_upload(temp_path, mime_type, access_token=access_token)
             
+            if not handle:
+                return jsonify({"success": False, "error": "Upload failed. Meta did not return a media handle."}), 500
+
             return jsonify({"success": True, "handle": handle}), 200
             
         finally:
@@ -513,6 +528,7 @@ def upload_template_media():
 # ==============================================================
 
 @template_bp.route("/", methods=["GET"])
+@template_bp.route("", methods=["GET"])
 def get_templates():
     """
     List templates with sorting and filtering.
@@ -520,8 +536,9 @@ def get_templates():
     Query Params:
     - account_id: Filter by account
     - workspace_id: Filter by workspace (resolves to account)
+    - status: Filter by status (e.g. APPROVED, PENDING, REJECTED)
     - sort: date_desc (default), date_asc, name_asc, name_desc, status
-    - limit: Max items (default 50)
+    - limit: Max items (optional, no limit by default)
     
     Response:
     [
@@ -534,8 +551,9 @@ def get_templates():
         
         account_id = request.args.get("account_id")
         workspace_id = request.args.get("workspace_id")
+        status_filter = request.args.get("status")
         sort_option = request.args.get("sort", "date_desc")
-        limit = request.args.get("limit", 100, type=int)
+        limit = request.args.get("limit", type=int)  # No default cap — load all
         
         # Resolve account_id from workspace_id if provided
         if not account_id and workspace_id:
@@ -547,11 +565,10 @@ def get_templates():
         
         if account_id:
             query = query.filter_by(account_id=account_id)
-        
-        # Status filter (e.g. ?status=APPROVED)
-        status_filter = request.args.get("status")
+
+        # Filter by status if provided (e.g. APPROVED, PENDING, REJECTED)
         if status_filter:
-            query = query.filter(WhatsAppTemplate.status == status_filter)
+            query = query.filter(WhatsAppTemplate.status == status_filter.upper())
             
         # Sorting
         if sort_option == "date_asc":
@@ -564,10 +581,14 @@ def get_templates():
             query = query.order_by(WhatsAppTemplate.status.asc())
         else: # date_desc / default
             query = query.order_by(WhatsAppTemplate.created_at.desc())
-            
-        templates = query.limit(limit).all()
         
-        return jsonify({"templates": [t.to_dict() for t in templates]}), 200
+        # Only apply limit if explicitly requested
+        if limit and limit > 0:
+            templates = query.limit(limit).all()
+        else:
+            templates = query.all()
+        
+        return jsonify({"success": True, "templates": [t.to_dict() for t in templates]}), 200
         
     except Exception as e:
         logger.exception("Error listing templates")
@@ -606,8 +627,7 @@ def get_template_status(template_id):
         # Calculate how long it's been pending
         pending_seconds = None
         if template.submitted_at and template.status == "PENDING":
-            submitted_at = ensure_tz_aware(template.submitted_at)
-            pending_seconds = (datetime.now(timezone.utc) - submitted_at).total_seconds()
+            pending_seconds = (datetime.now(timezone.utc) - template.submitted_at).total_seconds()
         
         # Update confidence_post_submit if still pending
         if template.status == "PENDING" and pending_seconds:

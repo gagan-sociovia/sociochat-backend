@@ -7,9 +7,8 @@ Executes interactive automation flows when users send messages or click buttons.
 This engine:
 1. Checks if any active interactive automation matches the incoming message trigger
 2. Tracks conversation state (which node the user is at)
-3. Sends interactive messages with buttons OR approved WhatsApp templates
+3. Sends interactive messages with buttons
 4. Handles button click responses and navigates to the next node
-5. Supports template chaining (template → template → message → end)
 """
 
 import logging
@@ -18,14 +17,12 @@ from typing import Dict, Any, Optional, Tuple, List
 
 from models import db
 from .visual_automation_models import WhatsAppVisualAutomation, WhatsAppConversationState
-from .models import WhatsAppAccount, WhatsAppConversation, WhatsAppMessage, WhatsAppTemplate
+from .models import WhatsAppAccount, WhatsAppConversation, WhatsAppMessage
 from .services import WhatsAppService
+from .template_node_executor import TemplateNodeExecutor
 from notifications import notification_manager
 
 logger = logging.getLogger(__name__)
-
-# Node types that can be sent as messages in the flow
-SENDABLE_NODE_TYPES = {"message", "template"}
 
 
 class InteractiveAutomationEngine:
@@ -95,6 +92,10 @@ class InteractiveAutomationEngine:
         except Exception as e:
             print(f"   ⚠️ Interactive automation error: {e}")
             logger.exception(f"Interactive automation error (non-fatal): {e}")
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
             return None
     
     def _get_active_conversation_state(self, conversation_id: int) -> Optional[WhatsAppConversationState]:
@@ -183,7 +184,7 @@ class InteractiveAutomationEngine:
             logger.error(f"Automation {automation.id} has no trigger node")
             return None
         
-        # Find the first sendable node connected to the trigger (message or template)
+        # Find the first node connected to the trigger (message or template)
         trigger_id = trigger_node.get("id")
         first_node = None
         
@@ -191,7 +192,7 @@ class InteractiveAutomationEngine:
             if edge.get("source") == trigger_id:
                 target_id = edge.get("target")
                 for node in nodes:
-                    if node.get("id") == target_id and node.get("type") in SENDABLE_NODE_TYPES:
+                    if node.get("id") == target_id and node.get("type") in ("message", "template"):
                         first_node = node
                         break
                 break
@@ -217,9 +218,14 @@ class InteractiveAutomationEngine:
         db.session.commit()
         
         # Send the first node (message or template)
-        return self._send_node_message(
-            automation, first_node, from_phone, state
-        )
+        if first_node.get("type") == "template":
+            return self._send_template_node(
+                automation, first_node, from_phone, state
+            )
+        else:
+            return self._send_node_message(
+                automation, first_node, from_phone, state
+            )
     
     def _handle_flow_continuation(
         self,
@@ -269,13 +275,35 @@ class InteractiveAutomationEngine:
         next_node_id = None
         
         if is_button_reply and button_payload:
-            # Button payload is the button ID - find edge with this sourceHandle
-            print(f"      Looking for edge with sourceHandle={button_payload}")
-            for edge in edges:
-                if edge.get("sourceHandle") == button_payload:
-                    next_node_id = edge.get("target")
-                    print(f"      ✓ Found edge -> {next_node_id}")
-                    break
+            # Check if this is a template button payload (iflow_ prefix)
+            decoded = TemplateNodeExecutor.decode_button_payload(button_payload)
+            if decoded:
+                decoded_automation_id = decoded.get('automation_id')
+                decoded_node_id = decoded.get('target_node_id')
+                print(f"      🎯 Decoded template button: automation={decoded_automation_id}, target={decoded_node_id}")
+                
+                # Verify the automation ID matches
+                if str(decoded_automation_id) == str(automation.id):
+                    if decoded_node_id is None:
+                        # Template button pointed to flow end (target_node_id is None means END)
+                        print(f"      ✓ Template button -> END, completing flow")
+                        state.complete()
+                        db.session.commit()
+                        return {"flow_completed": True, "reason": "template_end_button"}
+                    else:
+                        next_node_id = decoded_node_id
+                        print(f"      ✓ Template button -> {next_node_id}")
+                else:
+                    print(f"      ⚠️ Decoded automation ID {decoded_automation_id} doesn't match current {automation.id}")
+            
+            # Regular button payload - find edge with this sourceHandle
+            if not next_node_id:
+                print(f"      Looking for edge with sourceHandle={button_payload}")
+                for edge in edges:
+                    if edge.get("sourceHandle") == button_payload:
+                        next_node_id = edge.get("target")
+                        print(f"      ✓ Found edge -> {next_node_id}")
+                        break
         else:
             # Text response - check if current node has any "any_reply" type button
             # or if there's a default continuation
@@ -303,23 +331,39 @@ class InteractiveAutomationEngine:
                                     print(f"      ✓ Text matched button, going to {next_node_id}")
                                     break
                             break
-            elif current_node and current_node.get("type") == "template":
-                # Template nodes - match text against template button labels
-                buttons = current_node.get("data", {}).get("buttons", [])
-                print(f"      Current template node has {len(buttons)} buttons")
-                for idx, button in enumerate(buttons):
-                    label = button.get("text", "")
-                    print(f"        Template button: '{label}' (checking vs '{message_text}')")
-                    if label.lower() == message_text.lower():
-                        btn_handle = button.get("handleId") or f"{current_node_id}-btn-{idx}"
-                        for edge in edges:
-                            if edge.get("sourceHandle") == btn_handle:
-                                next_node_id = edge.get("target")
-                                print(f"      ✓ Text matched template button, going to {next_node_id}")
-                                break
-                        break
+            else:
+                print(f"      ⚠️ Current node not found or not a message node")
         
         if not next_node_id:
+            # No matching next node - check if button has a special action (like send_document)
+            # that should be executed even without a connection
+            if is_button_reply and button_payload:
+                button_action = self._get_button_action(nodes, current_node_id, button_payload)
+                if button_action and button_action.get("type") == "send_document":
+                    print(f"      🔄 Button has send_document action - executing without edge")
+                    self._execute_button_action(
+                        nodes=nodes,
+                        current_node_id=current_node_id,
+                        button_payload=button_payload,
+                        to_phone=from_phone,
+                        conversation_id=state.conversation_id
+                    )
+                    
+                    # After sending document, look for a default edge from this node
+                    # (an edge from the node itself, not from a specific button)
+                    for edge in edges:
+                        if edge.get("source") == current_node_id and not edge.get("sourceHandle"):
+                            next_node_id = edge.get("target")
+                            print(f"      ✓ Found default edge -> {next_node_id}")
+                            break
+                    
+                    # If still no next node, complete the flow gracefully
+                    if not next_node_id:
+                        print(f"      🏁 No next node after send_document, completing flow")
+                        state.complete()
+                        db.session.commit()
+                        return {"completed": True, "document_sent": True, "message": "Document sent, flow completed"}
+            
             # No matching next node - user may have sent unexpected input
             # Clear the state and send a helpful message
             print(f"      ✗ No matching next node found. User sent unexpected input: '{message_text}'")
@@ -343,6 +387,16 @@ class InteractiveAutomationEngine:
             
             logger.info(f"Cleared state {state.id} after unexpected input")
             return {"state_cleared": True, "reason": "unexpected_input"}
+        
+        # Execute button action if this was a button click
+        if is_button_reply and button_payload:
+            self._execute_button_action(
+                nodes=nodes,
+                current_node_id=current_node_id,
+                button_payload=button_payload,
+                to_phone=from_phone,
+                conversation_id=state.conversation_id
+            )
         
         # Find the next node
         next_node = None
@@ -372,10 +426,106 @@ class InteractiveAutomationEngine:
                 return self._send_text_message(from_phone, end_message, state.conversation_id)
             return {"completed": True, "message": "Flow completed"}
         
+        # Check if this is a template node
+        if next_node.get("type") == "template":
+            db.session.commit()
+            return self._send_template_node(automation, next_node, from_phone, state)
+        
         db.session.commit()
         
         # Send the next message node
         return self._send_node_message(automation, next_node, from_phone, state)
+    
+    def _get_button_action(
+        self,
+        nodes: List[Dict[str, Any]],
+        current_node_id: str,
+        button_payload: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get the action configuration for a specific button.
+        Returns the action dict or None if not found.
+        """
+        # Find the current node
+        current_node = None
+        for node in nodes:
+            if node.get("id") == current_node_id:
+                current_node = node
+                break
+        
+        if not current_node or current_node.get("type") != "message":
+            return None
+        
+        # Find the clicked button
+        buttons = current_node.get("data", {}).get("buttons", [])
+        for button in buttons:
+            if button.get("id") == button_payload:
+                return button.get("action", {})
+        
+        return None
+
+    def _execute_button_action(
+        self,
+        nodes: List[Dict[str, Any]],
+        current_node_id: str,
+        button_payload: str,
+        to_phone: str,
+        conversation_id: Optional[int] = None
+    ) -> None:
+        """
+        Execute button-specific action when user clicks a button.
+        Handles send_document actions and other special button behaviors.
+        """
+        # Find the current node
+        current_node = None
+        for node in nodes:
+            if node.get("id") == current_node_id:
+                current_node = node
+                break
+        
+        if not current_node or current_node.get("type") != "message":
+            return
+        
+        # Find the clicked button
+        buttons = current_node.get("data", {}).get("buttons", [])
+        clicked_button = None
+        for button in buttons:
+            if button.get("id") == button_payload:
+                clicked_button = button
+                break
+        
+        if not clicked_button:
+            print(f"      Button {button_payload} not found in node {current_node_id}")
+            return
+        
+        action = clicked_button.get("action", {})
+        action_type = action.get("type")
+        
+        print(f"      Executing button action: {action_type}")
+        
+        if action_type == "send_document":
+            # Send the document attached to this button
+            document_url = action.get("documentUrl")
+            document_filename = action.get("documentFilename", "document.pdf")
+            document_caption = action.get("documentCaption", "")
+            
+            if document_url:
+                print(f"      Sending document: {document_url} ({document_filename})")
+                account = WhatsAppAccount.query.get(self.account_id)
+                if account:
+                    service = WhatsAppService(
+                        phone_number_id=account.phone_number_id,
+                        access_token=account.get_access_token(),
+                    )
+                    result = service.send_document(
+                        to=to_phone,
+                        document_url=document_url,
+                        caption=document_caption,
+                        filename=document_filename
+                    )
+                    print(f"      Document send result: {result}")
+            else:
+                print(f"      ⚠️ send_document action has no documentUrl")
     
     def _send_node_message(
         self,
@@ -385,21 +535,27 @@ class InteractiveAutomationEngine:
         state: WhatsAppConversationState,
     ) -> Dict[str, Any]:
         """
-        Send a node's content to the user.
-        Dispatches to the appropriate sender based on node type.
+        Send a message node's content to the user.
+        Supports text, image, video, and document headers.
         """
-        node_type = node.get("type", "message")
-        
-        # Template nodes use WhatsApp template API
-        if node_type == "template":
-            return self._send_template_node_message(automation, node, to_phone, state)
-        
-        # Default: send as interactive message with buttons
         node_data = node.get("data", {})
         body = node_data.get("body", "")
         header = node_data.get("header")
         footer = node_data.get("footer")
         buttons = node_data.get("buttons", [])
+        
+        # Header media support - try both camelCase and snake_case keys
+        header_image_url = node_data.get("headerImageUrl") or node_data.get("header_image_url")
+        header_video_url = node_data.get("headerVideoUrl") or node_data.get("header_video_url")
+        header_document_url = node_data.get("headerDocumentUrl") or node_data.get("header_document_url")
+        header_document_filename = node_data.get("headerDocumentFilename") or node_data.get("header_document_filename")
+        
+        # Debug: Log the node data and extracted headers
+        print(f"      [DEBUG] Node data keys: {list(node_data.keys())}")
+        print(f"      [DEBUG] Full node_data: {node_data}")
+        print(f"      [DEBUG] header_image_url: {header_image_url}")
+        print(f"      [DEBUG] header_video_url: {header_video_url}")
+        print(f"      [DEBUG] header_document_url: {header_document_url}")
         
         # Get WhatsApp account for sending
         account = WhatsAppAccount.query.get(self.account_id)
@@ -439,21 +595,28 @@ class InteractiveAutomationEngine:
             
             print(f"          action_type={action_type}, label='{button_label}', id={button_id}")
             
-            if action_type in ("quick_reply", "reply", None):
-                # Only include if button has a target node connected
+            if action_type in ("quick_reply", "reply", "send_document", None):
+                # Include interactive buttons - quick_reply buttons need a target node connection
+                # send_document buttons work with or without a connection (they send a document)
+                has_connection = False
                 for edge in (automation.edges or []):
                     if edge.get("sourceHandle") == button_id:
-                        # Ensure title is not empty (Meta requires this)
-                        title = button_label if button_label else f"Option {idx + 1}"
-                        interactive_buttons.append({
-                            "type": "reply",
-                            "reply": {
-                                "id": button_id,
-                                "title": title[:20]  # Max 20 chars for WhatsApp
-                            }
-                        })
-                        print(f"          ✓ Added interactive button: {title[:20]}")
+                        has_connection = True
                         break
+                
+                # For send_document, always include the button even without a connection
+                # For quick_reply, only include if there's a connection
+                if has_connection or action_type == "send_document":
+                    # Ensure title is not empty (Meta requires this)
+                    title = button_label if button_label else f"Option {idx + 1}"
+                    interactive_buttons.append({
+                        "type": "reply",
+                        "reply": {
+                            "id": button_id,
+                            "title": title[:20]  # Max 20 chars for WhatsApp
+                        }
+                    })
+                    print(f"          ✓ Added interactive button: {title[:20]} (action={action_type})")
             elif action_type == "call":
                 # Call buttons - append phone number to message body
                 phone_number = action.get("phoneNumber") or action.get("phone") or action.get("value")
@@ -493,12 +656,26 @@ class InteractiveAutomationEngine:
                 to=to_phone,
                 body_text=body,
                 buttons=interactive_buttons,
-                header_text=header,
+                header_text=header if not (header_image_url or header_video_url or header_document_url) else None,
+                header_image_url=header_image_url,
+                header_video_url=header_video_url,
+                header_document_url=header_document_url,
+                header_document_filename=header_document_filename,
                 footer_text=footer,
             )
         else:
-            # No buttons - send as plain text
-            result = service.send_text(to=to_phone, text=body)
+            # No buttons - send as plain text (or image if header has media)
+            if header_image_url:
+                # Send image with caption
+                result = service.send_image(to=to_phone, image_url=header_image_url, caption=body)
+            elif header_video_url:
+                # Send video with caption
+                result = service.send_video(to=to_phone, video_url=header_video_url, caption=body)
+            elif header_document_url:
+                # Send document with caption
+                result = service.send_document(to=to_phone, document_url=header_document_url, caption=body, filename=header_document_filename)
+            else:
+                result = service.send_text(to=to_phone, text=body)
         
         if result.get("success"):
             logger.info(f"Sent interactive automation message to {to_phone}")
@@ -579,114 +756,6 @@ class InteractiveAutomationEngine:
             logger.error(f"Failed to send automation message: {result.get('error')}")
             return {"success": False, "error": result.get("error")}
     
-    def _send_template_node_message(
-        self,
-        automation: WhatsAppVisualAutomation,
-        node: Dict[str, Any],
-        to_phone: str,
-        state: WhatsAppConversationState,
-    ) -> Dict[str, Any]:
-        """
-        Send a template node's content to the user via WhatsApp Template API.
-        
-        Template nodes reference approved Meta templates. Quick-reply button
-        payloads are mapped to flow edges so the engine can navigate on click.
-        """
-        node_data = node.get("data", {})
-        template_name = node_data.get("templateName", "")
-        language_code = node_data.get("languageCode", "en_US")
-        template_id = node_data.get("templateId")
-        body_params = node_data.get("bodyParams")  # Optional variable values
-        header_text_var = node_data.get("headerTextVar")  # Optional header variable
-        header_image_url = node_data.get("headerImageUrl")
-        
-        if not template_name:
-            logger.error(f"Template node {node.get('id')} has no templateName")
-            return {"error": "Template node missing templateName"}
-        
-        # Get WhatsApp account for sending
-        account = WhatsAppAccount.query.get(self.account_id)
-        if not account:
-            logger.error(f"Account {self.account_id} not found")
-            return {"error": "Account not found"}
-        
-        service = WhatsAppService(
-            phone_number_id=account.phone_number_id,
-            access_token=account.get_access_token(),
-        )
-        
-        # Build button payloads for quick_reply buttons
-        # Map template buttons to flow edges
-        template_buttons = node_data.get("buttons", [])
-        button_payloads = []
-        has_connected_buttons = False
-        
-        for idx, btn in enumerate(template_buttons):
-            # Check if this button has a connected edge in the flow
-            btn_handle = btn.get("handleId") or f"{node.get('id')}-btn-{idx}"
-            for edge in (automation.edges or []):
-                if edge.get("sourceHandle") == btn_handle:
-                    has_connected_buttons = True
-                    break
-            
-            # For quick_reply buttons, set payload to the handle ID so we can
-            # match it to the edge when the user clicks
-            payload_value = btn.get("payload") or btn_handle
-            button_payloads.append({
-                "index": idx,
-                "type": "quick_reply",
-                "value": payload_value,
-            })
-        
-        # If no buttons have connections, this is a terminal template node
-        if not has_connected_buttons and template_buttons:
-            print(f"      🏁 Terminal template node, completing state")
-            state.complete()
-            db.session.commit()
-        
-        # Send the template
-        print(f"      📋 Sending template: {template_name} (lang={language_code})")
-        
-        result = service.send_template_with_builder(
-            to=to_phone,
-            template_name=template_name,
-            language_code=language_code,
-            body_params=body_params,
-            header_text=header_text_var,
-            header_image_url=header_image_url,
-            button_payloads=button_payloads if button_payloads else None,
-        )
-        
-        if result.get("success"):
-            logger.info(f"Sent template automation message '{template_name}' to {to_phone}")
-            
-            # Broadcast SSE for real-time inbox update
-            try:
-                message_id = result.get("message_id")
-                conversation_id = result.get("conversation_id") or state.conversation_id
-                
-                msg_record = WhatsAppMessage.query.get(message_id)
-                if msg_record:
-                    notification_manager.broadcast("whatsapp_message_received", {
-                        "message": msg_record.to_dict(),
-                        "conversation_id": conversation_id,
-                        "account_id": self.account_id,
-                        "workspace_id": self.workspace_id
-                    })
-            except Exception as e:
-                logger.error(f"Failed to broadcast template automation message: {e}")
-            
-            return {
-                "success": True,
-                "automation_id": automation.id,
-                "node_id": node.get("id"),
-                "message_id": result.get("message_id"),
-                "template_name": template_name,
-            }
-        else:
-            logger.error(f"Failed to send template automation message: {result.get('error')}")
-            return {"success": False, "error": result.get("error")}
-    
     def _send_text_message(self, to_phone: str, text: str, conversation_id: int = None) -> Dict[str, Any]:
         """Send a simple text message and broadcast via SSE."""
         account = WhatsAppAccount.query.get(self.account_id)
@@ -723,11 +792,148 @@ class InteractiveAutomationEngine:
                 })
             except Exception as e:
                 logger.error(f"Failed to save/broadcast text message: {e}")
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
         
         return {
             "success": result.get("success", False),
             "message_id": result.get("message_id"),
         }
+    
+    def _send_template_node(
+        self,
+        automation: WhatsAppVisualAutomation,
+        node: Dict[str, Any],
+        to_phone: str,
+        state: WhatsAppConversationState,
+    ) -> Dict[str, Any]:
+        """
+        Send a template node's message to the user.
+        
+        Template nodes have:
+        - template_id: ID of the template to use
+        - template_name: Name of the template
+        - button_mappings: Dict mapping button IDs to target node IDs for flow routing
+        - variables: Optional variables to substitute in template
+        """
+        node_data = node.get("data", {})
+        template_id = node_data.get("template_id")
+        template_name = node_data.get("template_name")
+        button_mappings = node_data.get("button_mappings", {})
+        variables = node_data.get("variables", {})
+        
+        print(f"    📋 Sending template node: {template_name} (ID: {template_id})")
+        print(f"       Button mappings: {button_mappings}")
+        
+        if not template_id and not template_name:
+            logger.error(f"Template node {node.get('id')} has no template configured")
+            return {"error": "No template configured"}
+        
+        # Get WhatsApp account for sending
+        account = WhatsAppAccount.query.get(self.account_id)
+        if not account:
+            logger.error(f"Account {self.account_id} not found")
+            return {"error": "Account not found"}
+        
+        # Get template from database to get full details
+        from .whatsapp_templates import WhatsAppTemplate
+        
+        template = None
+        if template_id:
+            template = WhatsAppTemplate.query.filter_by(
+                id=template_id,
+                workspace_id=self.workspace_id
+            ).first()
+        elif template_name:
+            template = WhatsAppTemplate.query.filter_by(
+                name=template_name,
+                workspace_id=self.workspace_id,
+                status='APPROVED'
+            ).first()
+        
+        if not template:
+            logger.error(f"Template {template_id or template_name} not found")
+            return {"error": "Template not found"}
+        
+        # Prepare runtime variables
+        runtime_variables = self._get_runtime_variables(to_phone, state)
+        runtime_variables.update(variables)
+        
+        # Build template components with encoded button payloads
+        components = TemplateNodeExecutor.build_template_components(
+            template=template,
+            automation_id=automation.id,
+            button_mappings=button_mappings,
+            variables=runtime_variables,
+        )
+        
+        # Send template
+        service = WhatsAppService(
+            phone_number_id=account.phone_number_id,
+            access_token=account.get_access_token(),
+        )
+        
+        result = service.send_template(
+            to=to_phone,
+            template_name=template.name,
+            language_code=template.language or "en",
+            components=components,
+        )
+        
+        if result.get("success"):
+            logger.info(f"Sent template {template.name} to {to_phone}")
+            
+            # Check if this template has no quick reply buttons (end of flow)
+            has_quick_reply_buttons = False
+            if template.components:
+                for comp in template.components:
+                    if comp.get("type") == "BUTTONS":
+                        for btn in comp.get("buttons", []):
+                            if btn.get("type") == "QUICK_REPLY":
+                                has_quick_reply_buttons = True
+                                break
+                    if has_quick_reply_buttons:
+                        break
+            
+            if not has_quick_reply_buttons:
+                # No quick reply buttons = flow ends here
+                print(f"      🏁 Template has no quick reply buttons, completing flow")
+                state.complete()
+                db.session.commit()
+            
+            return {
+                "success": True,
+                "automation_id": automation.id,
+                "node_id": node.get("id"),
+                "message_id": result.get("message_id"),
+                "template": template.name,
+            }
+        else:
+            logger.error(f"Failed to send template: {result.get('error')}")
+            return {"success": False, "error": result.get("error")}
+    
+    def _get_runtime_variables(
+        self,
+        to_phone: str,
+        state: WhatsAppConversationState,
+    ) -> Dict[str, str]:
+        """Get runtime variables for template substitution."""
+        variables = {
+            "phone": to_phone,
+        }
+        
+        # Try to get contact/conversation info
+        try:
+            conversation = WhatsAppConversation.query.get(state.conversation_id)
+            if conversation:
+                variables["contact_name"] = conversation.contact_name or ""
+                variables["customer_name"] = conversation.contact_name or ""
+        except Exception as e:
+            logger.debug(f"Could not get conversation info: {e}")
+        
+        return variables
 
 
 def process_interactive_automation(
@@ -778,4 +984,8 @@ def process_interactive_automation(
         
     except Exception as e:
         logger.exception(f"Interactive automation processing error: {e}")
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
         return None

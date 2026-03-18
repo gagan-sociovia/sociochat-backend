@@ -122,24 +122,64 @@ def validate_template_message(data: Dict[str, Any]) -> Tuple[str, str, str, Opti
     language = data.get("language", "en")
     
     # Check for components from multiple possible fields
-    components = data.get("components") or data.get("params")
-    body_params = data.get("body_params")
+    components = data.get("components") or data.get("params") or []
+    if not isinstance(components, list):
+        components = [components] if components else []
     
-    # If body_params is provided (from frontend), convert to components format
-    # OR pass through if it's a dict (named parameters) for TemplateBuilder
+    body_params = data.get("body_params")
+    header_image_url = data.get("header_image_url")
+    header_video_url = data.get("header_video_url")
+    header_document_url = data.get("header_document_url")
+    header_text = data.get("header_text")
+    
+    # Process Header (Image/Video/Document/Text)
+    header_comp = None
+    if header_image_url:
+        header_comp = {
+            "type": "header",
+            "parameters": [{"type": "image", "image": {"link": header_image_url}}]
+        }
+    elif header_video_url:
+        header_comp = {
+            "type": "header",
+            "parameters": [{"type": "video", "video": {"link": header_video_url}}]
+        }
+    elif header_document_url:
+        header_comp = {
+            "type": "header",
+            "parameters": [{"type": "document", "document": {"link": header_document_url}}]
+        }
+    elif header_text:
+        header_comp = {
+            "type": "header",
+            "parameters": [{"type": "text", "text": str(header_text)}]
+        }
+    
+    if header_comp:
+        # Check if header already exists in components list
+        has_header = any(c.get("type", "").lower() == "header" for c in components)
+        if not has_header:
+            components.append(header_comp)
+
+    # Process Body Params
     if body_params:
         if isinstance(body_params, list) and len(body_params) > 0:
-            components = [{
+            body_comp = {
                 "type": "body",
                 "parameters": [{"type": "text", "text": str(p)} for p in body_params],
-            }]
+            }
+            # Add or replace body
+            components = [c for c in components if c.get("type", "").lower() != "body"]
+            components.append(body_comp)
         elif isinstance(body_params, dict):
             # Named parameters - pass as is, service layer will use TemplateBuilder
-            # We return it in the components tuple slot, but as a dict wrapper
-            components = [{"type": "body", "named_params": body_params}]
+            body_comp = {"type": "body", "named_params": body_params}
+            components = [c for c in components if c.get("type", "").lower() != "body"]
+            components.append(body_comp)
             
-    # Convert simple params list to components format
-    elif isinstance(components, list) and len(components) > 0:
+    # Convert simple params list to components format if no body found yet
+    has_body = any(c.get("type", "").lower() == "body" for c in components)
+    if not has_body and isinstance(components, list) and len(components) > 0:
         if not isinstance(components[0], dict):
             # Simple list of values - convert to body parameters
             components = [{
@@ -147,6 +187,10 @@ def validate_template_message(data: Dict[str, Any]) -> Tuple[str, str, str, Opti
                 "parameters": [{"type": "text", "text": str(p)} for p in components],
             }]
     
+    # Return empty list if no components at all
+    if not components:
+        components = None
+        
     return to, template_name, language, components
 
 

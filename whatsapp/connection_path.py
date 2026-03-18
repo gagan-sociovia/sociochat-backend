@@ -439,14 +439,6 @@ def connect_manual(
                     logger.info(f"Re-activated account {existing_account.id} with valid token")
                 else:
                     logger.info(f"Account already connected with valid token, no update needed")
-                
-                # Always re-subscribe to webhooks (subscription can go stale)
-                try:
-                    setup_result = _run_post_connection_setup(existing_account.id, waba_id, existing_token)
-                    logger.info(f"Webhook re-subscription result: {setup_result}")
-                except Exception as e:
-                    logger.warning(f"Webhook re-subscription warning: {e}")
-                
                 return {
                     "success": True,
                     "message": "Account already connected with valid token",
@@ -454,13 +446,8 @@ def connect_manual(
                     "was_updated": was_reactivated
                 }
         
-        
-        # Determine token type (test numbers or short tokens are temporary)
-        is_temporary = phone_status.get("is_test_number", False) or len(access_token) < 200
-        token_type = "temporary" if is_temporary else "permanent"
-        
         # Update existing account with new token
-        existing_account.set_access_token(access_token, token_type)
+        existing_account.set_access_token(access_token, "permanent")
         existing_account.is_active = True
         existing_account.connected_by_user_id = user_id
         existing_account.last_synced_at = datetime.now(timezone.utc)
@@ -494,12 +481,7 @@ def connect_manual(
         connected_by_user_id=user_id,
         is_active=True,
     )
-    
-    # Determine token type (test numbers or short tokens are temporary)
-    is_temporary = phone_status.get("is_test_number", False) or len(access_token) < 200
-    token_type = "temporary" if is_temporary else "permanent"
-    
-    new_account.set_access_token(access_token, token_type)
+    new_account.set_access_token(access_token, "permanent")
     new_account.last_synced_at = datetime.now(timezone.utc)
     
     db.session.add(new_account)

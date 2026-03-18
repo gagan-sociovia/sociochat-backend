@@ -114,6 +114,10 @@ def process_drip_campaigns():
         # 1. Fetch due enrollments — SKIP LOCKED prevents duplicate
         #    processing across multiple Gunicorn workers.
         #    Each worker claims unclaimed rows; already-locked rows are skipped.
+        #    We fetch one by one in a loop or process as a batch but with careful locking.
+        
+        # Strategy: Fetch IDs of due enrollments first, then process each individually
+        # to keep transactions short and locks granular.
         due_enrollments = (
             WhatsAppDripEnrollment.query
             .filter(
@@ -128,10 +132,28 @@ def process_drip_campaigns():
         if not due_enrollments:
             return
 
-        logger.info(f"Processing {len(due_enrollments)} drip enrollments...")
+        # Immediately mark them as 'processing' or a temporary state if we had one,
+        # but since we don't want to change schema right now, we'll process them
+        # in the current transaction or one-by-one with fresh locks.
+        
+        # To avoid the 'commit releases all locks' issue:
+        # We process each enrollment in a nested-like fashion or just be careful.
+        # The best way in SQLAlchemy for this is to keep the IDs and re-fetch with lock
+        # inside the loop with its own commit.
+        
+        enrollment_ids = [e.id for e in due_enrollments]
+        # Release the initial batch lock by committing (we will re-lock individually)
+        db.session.commit()
 
-        for enrollment in due_enrollments:
+        logger.info(f"Processing {len(enrollment_ids)} drip enrollments...")
+
+        for eid in enrollment_ids:
             try:
+                # Re-fetch with lock for THIS specific row
+                enrollment = WhatsAppDripEnrollment.query.with_for_update(skip_locked=True).get(eid)
+                if not enrollment or enrollment.status != "active":
+                    continue
+
                 # Check campaign status before processing
                 campaign = WhatsAppDripCampaign.query.get(enrollment.campaign_id)
                 # Skip if not active/running (e.g. scheduled, drafted, paused)
@@ -139,94 +161,35 @@ def process_drip_campaigns():
                     continue
 
                 process_single_enrollment(enrollment)
-                # Commit per-enrollment so row locks are released quickly
+                # Commit releases only THIS row's lock
                 db.session.commit()
             except Exception as e:
-                logger.error(f"Failed to process enrollment {enrollment.id}: {e}")
+                logger.error(f"Failed to process enrollment {eid}: {e}")
                 db.session.rollback()
-                # Don't fail the whole batch
 
     except Exception as e:
         logger.exception(f"Drip scheduler error: {e}")
         db.session.rollback()
     finally:
-        db.session.remove()  # Return connection to pool
+        db.session.remove()
 
 
-def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
-    """
-    Process a single enrollment: Send message and advance step.
-    """
-    campaign = WhatsAppDripCampaign.query.get(enrollment.campaign_id)
-    if not campaign or campaign.status != "active":
-        # Pause enrollment if campaign paused/deleted
-        enrollment.status = "paused"
-        return
-
-    # Determine next step
-    next_step_order = enrollment.current_step_order + 1
-
-    step = WhatsAppDripStep.query.filter_by(
-        campaign_id=enrollment.campaign_id,
-        step_order=next_step_order
-    ).first()
-
-    if not step:
-        # No more steps -> Complete
-        enrollment.status = "completed"
-        enrollment.next_run_at = None
-        campaign.completed_count = (campaign.completed_count or 0) + 1
-        return
-
-    # Send Message
-    account = WhatsAppAccount.query.get(campaign.account_id)
-    if not account:
-        logger.error(f"Account {campaign.account_id} not found for drip {campaign.id}")
-        enrollment.status = "failed"
-        return
-
-    service = WhatsAppService(db.session, account.phone_number_id, account.get_access_token())
-
-    # Send Template
-    result = service.send_template(
-        to=enrollment.phone_number,
-        template_name=step.template_name,
-        language_code=step.language
-    )
-
-    if result.get("success"):
-        # Advance state
-        enrollment.current_step_order = step.step_order
-
-        # Calculate next run time based on NEXT step's delay
-        next_next_step = WhatsAppDripStep.query.filter_by(
-            campaign_id=enrollment.campaign_id,
-            step_order=step.step_order + 1
-        ).first()
-
-        if next_next_step:
-            enrollment.next_run_at = datetime.now(timezone.utc) + timedelta(seconds=next_next_step.delay_seconds)
-        else:
-            # No next step, mark complete
-            enrollment.status = "completed"
-            enrollment.next_run_at = None
-            campaign.completed_count = (campaign.completed_count or 0) + 1
-
-        logger.info(f"[DRIP] Campaign {campaign.id} Step {step.step_order} sent to {enrollment.phone_number}")
-
-    else:
-        logger.error(f"Drip send failed: {result}")
-        # Bump retry by 1 hour to avoid spam loop on failure
-        enrollment.next_run_at = datetime.now(timezone.utc) + timedelta(hours=1)
+# Note: Duplicate process_single_enrollment removed for production readiness.
+# The advanced version starting at line 270 is the one being used.
 
 
 def trigger_campaign_now(campaign_id):
     logger.info(f"___TRIGGER_CAMPAIGN_NOW called for ID {campaign_id}___")
     try:
         from .drip_models import WhatsAppDripCampaign, WhatsAppDripEnrollment
-        campaign = WhatsAppDripCampaign.query.get(campaign_id)
+        campaign = (
+            WhatsAppDripCampaign.query
+            .filter_by(id=campaign_id)
+            .with_for_update(skip_locked=True)
+            .first()
+        )
         if not campaign:
-            logger.error(f"Campaign {campaign_id} not found")
+            logger.error(f"Campaign {campaign_id} not found or already being processed")
             return
 
         # If it was scheduled, mark it running
@@ -242,35 +205,51 @@ def trigger_campaign_now(campaign_id):
                 campaign.trigger_value = None
                 db.session.commit()
             logger.info(f"Campaign {campaign_id} already RUNNING, processing enrollments...")
+        else:
+            # If it's drafted or something else, we might still want to commit the lock release if we checked it
+            db.session.commit()
 
-        # Fetch pending enrollments (status=active)
+        # Fetch IDs and process individually to avoid the 'commit releases all' lock issue
         enrollments = WhatsAppDripEnrollment.query.filter_by(
             campaign_id=campaign_id,
             status="active"
         ).all()
         
-        logger.info(f"Found {len(enrollments)} active enrollments for campaign {campaign_id}")
+        enrollment_ids = [e.id for e in enrollments]
+        logger.info(f"Found {len(enrollment_ids)} active enrollments for campaign {campaign_id}")
         
-        for enrollment in enrollments:
+        for eid in enrollment_ids:
             try:
+                enrollment = (
+                    WhatsAppDripEnrollment.query
+                    .filter_by(id=eid, status="active")
+                    .with_for_update(skip_locked=True)
+                    .first()
+                )
+                if not enrollment:
+                    continue
+                    
                 logger.info(f"Processing enrollment {enrollment.id} (Phone: {enrollment.phone_number})...")
                 process_single_enrollment(enrollment)
+                db.session.commit()
             except Exception as e:
-                logger.error(f"Failed to process enrollment {enrollment.id}: {e}")
+                logger.error(f"Failed to process enrollment {eid}: {e}")
+                db.session.rollback()
                 
-        db.session.commit()
     except Exception as e:
         logger.exception(f"Error triggering campaign {campaign_id}: {e}")
         db.session.rollback()
     finally:
-        db.session.remove()  # Return connection to pool
+        db.session.remove()
 
 
 
 def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
-    """
-    Process a single enrollment: Send message with parameters and advance step.
-    """
+    # Defensive Check: Verify it hasn't been processed by another worker
+    if enrollment.status != "active":
+        logger.info(f"DRIP ENGINE - Skipping enrollment {enrollment.id} because status is {enrollment.status}")
+        return
+
     campaign = WhatsAppDripCampaign.query.get(enrollment.campaign_id)
     if not campaign or campaign.status not in ["active", "running"]:
         # Pause enrollment if campaign paused/deleted
@@ -291,7 +270,7 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
          print(f"DEBUG: Enrollment {enrollment.id}: No step found for order {next_step_order}. Marking completed.")
          enrollment.status = "completed"
          enrollment.next_run_at = None
-         campaign.completed_count += 1
+         campaign.completed_count = (campaign.completed_count or 0) + 1
          return
 
     # Get account for sending
@@ -302,8 +281,6 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
         enrollment.status_reason = f"Account {campaign.account_id} not found"
         return
     
-    # Extract template parameters from variables
-    variables = enrollment.variables or {}
     # Extract template parameters from variables
     variables = enrollment.variables or {}
     logger.info(f"DRIP ENGINE - Enrollment {enrollment.id} Variables: {json.dumps(variables) if variables else 'None'}") # DEBUG LOG
@@ -330,8 +307,35 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
         if re.search(r'\{\{\s*[a-zA-Z_]+\w*\s*\}\}', template_record.body_text):
             is_named_template = True
             
-    components = None
-    params = [] # Normalized list for audit logs
+    components = []
+    params = [] # Initialize params list for audit log
+    
+    # Extract Header (Image/Video/Document/Text)
+    header_image = variables.get("header_image_url")
+    header_video = variables.get("header_video_url")
+    header_document = variables.get("header_document_url")
+    header_text = variables.get("header_text")
+    
+    if header_image:
+        components.append({
+            "type": "header",
+            "parameters": [{"type": "image", "image": {"link": str(header_image)}}]
+        })
+    elif header_video:
+        components.append({
+            "type": "header",
+            "parameters": [{"type": "video", "video": {"link": str(header_video)}}]
+        })
+    elif header_document:
+        components.append({
+            "type": "header",
+            "parameters": [{"type": "document", "document": {"link": str(header_document)}}]
+        })
+    elif header_text:
+        components.append({
+            "type": "header",
+            "parameters": [{"type": "text", "text": str(header_text)}]
+        })
     
     if is_named_template and template_record:
         # NAMED PARAMETERS LOGIC
@@ -367,10 +371,6 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
             if key in used_raw_keys:
                 continue
                 
-            # Check for number in key (supports '1', 'var_1', 'step_1_var_1' -> 'var_1' is passed as key here due to extract_step_params_dict)
-            # keys from extract_step_params_dict are already stripped of 'step_N_' prefix.
-            # So we expect '1', '2', 'name', 'var_1', 'customer_name' etc.
-            
             match = re.search(r'^(\d+)$|^var_(\d+)$|^variable_(\d+)$', key.lower())
             if match:
                 # Extract the number
@@ -379,7 +379,6 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
                     idx = int(num_str) - 1 # 1-based to 0-based
                     if 0 <= idx < len(expected_params):
                         target_param = expected_params[idx]
-                        # Only set if not already set by exact match
                         if target_param not in final_named_params:
                             final_named_params[target_param] = val
                             used_raw_keys.add(key)
@@ -387,7 +386,7 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
         logger.info(f"Step {step.step_order} PARAM MAPPING: Raw={raw_step_params.keys()} -> Expected={expected_params} -> Final={final_named_params}")
         
         if final_named_params:
-            # Build components with parameter_name
+            # Build body component with parameter_name
             body_parameters = []
             for name, value in final_named_params.items():
                 body_parameters.append({
@@ -397,7 +396,7 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
                 })
                 params.append(f"{name}={value}") # For audit log
                 
-            components = [{"type": "body", "parameters": body_parameters}]
+            components.append({"type": "body", "parameters": body_parameters})
             
     else:
         # POSITIONAL PARAMETERS LOGIC (Legacy)
@@ -406,8 +405,8 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
         
         if params:
             # Build standard body parameters
-            body_params_list = [{"type": "text", "text": p} for p in params]
-            components = [{"type": "body", "parameters": body_params_list}]
+            body_parameters = [{"type": "text", "text": str(p)} for p in params]
+            components.append({"type": "body", "parameters": body_parameters})
     
     # Store what we're sending for audit
     enrollment.last_sent_params = {
@@ -502,20 +501,33 @@ def process_due_drip_enrollments():
                 WhatsAppDripEnrollment.next_run_at <= now
             )
             .with_for_update(skip_locked=True)
+            .limit(100)
             .all()
         )
         
         if not due_enrollments:
             return {"processed": 0, "success": 0, "failed": 0}
         
-        logger.info(f"[DRIP_PROCESSOR] Found {len(due_enrollments)} due enrollments to process")
+        enrollment_ids = [e.id for e in due_enrollments]
+        db.session.commit() # Release batch lock
+
+        logger.info(f"[DRIP_PROCESSOR] Found {len(enrollment_ids)} due enrollments to process")
         
         processed = 0
         success_count = 0
         failed_count = 0
         
-        for enrollment in due_enrollments:
+        for eid in enrollment_ids:
             try:
+                enrollment = (
+                    WhatsAppDripEnrollment.query
+                    .filter_by(id=eid, status="active")
+                    .with_for_update(skip_locked=True)
+                    .first()
+                )
+                if not enrollment:
+                    continue
+
                 # Check if campaign is still active
                 campaign = WhatsAppDripCampaign.query.get(enrollment.campaign_id)
                 if not campaign or campaign.status not in ["active", "running"]:
@@ -536,7 +548,7 @@ def process_due_drip_enrollments():
                 db.session.commit()
                     
             except Exception as e:
-                logger.error(f"[DRIP_PROCESSOR] Failed to process enrollment {enrollment.id}: {e}")
+                logger.error(f"[DRIP_PROCESSOR] Failed to process enrollment {eid}: {e}")
                 db.session.rollback()
                 failed_count += 1
         
@@ -548,4 +560,4 @@ def process_due_drip_enrollments():
         db.session.rollback()
         return {"processed": 0, "success": 0, "failed": 0, "error": str(e)}
     finally:
-        db.session.remove()  # Return connection to pool
+        db.session.remove()

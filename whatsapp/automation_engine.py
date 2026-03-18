@@ -97,9 +97,13 @@ class AutomationEngine:
                 
                 if match_result["matched"]:
                     # Check per-contact override (allow disabling automations for specific contacts)
-                    if is_automation_disabled_for_contact(self.workspace_id, conversation_id, rule.rule_type):
-                        logger.debug(f"Rule {rule.id} ({rule.rule_type}) disabled for conversation {conversation_id}")
-                        continue
+                    try:
+                        if is_automation_disabled_for_contact(self.workspace_id, conversation_id, rule.rule_type):
+                            logger.debug(f"Rule {rule.id} ({rule.rule_type}) disabled for conversation {conversation_id}")
+                            continue
+                    except Exception as e:
+                        logger.warning(f"Failed to check contact override: {e}")
+                        db.session.rollback()
                     
                     # Check rate limiting
                     if not self._check_rate_limit(rule, conversation_id):
@@ -143,6 +147,10 @@ class AutomationEngine:
         except Exception as e:
             # CRITICAL: Never let automation errors break message processing
             logger.exception(f"Automation engine error: {e}")
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
             return None
     
     def _get_active_rules(self) -> List[WhatsAppAutomationRule]:
@@ -168,6 +176,10 @@ class AutomationEngine:
             return rules
         except Exception as e:
             logger.exception(f"Failed to fetch automation rules: {e}")
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
             return []
     
     def _check_rule_match(
@@ -265,6 +277,10 @@ class AutomationEngine:
                     }
             except Exception as e:
                 logger.exception(f"FAQ matching error: {e}")
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
             
             return {"matched": False}
         
@@ -298,6 +314,10 @@ class AutomationEngine:
             
         except Exception as e:
             logger.exception(f"Business hours check error: {e}")
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
             return True  # On error, assume within hours
     
     def _check_rate_limit(self, rule: WhatsAppAutomationRule, conversation_id: int) -> bool:
@@ -307,35 +327,43 @@ class AutomationEngine:
         Returns:
             True if rule can be triggered, False if rate limited
         """
-        # Check cooldown
-        cooldown = rule.cooldown_seconds or 0
-        if cooldown > 0:
-            cutoff = datetime.now(timezone.utc) - timedelta(seconds=cooldown)
+        try:
+            # Check cooldown
+            cooldown = rule.cooldown_seconds or 0
+            if cooldown > 0:
+                cutoff = datetime.now(timezone.utc) - timedelta(seconds=cooldown)
+                
+                recent_trigger = WhatsAppAutomationLog.query.filter(
+                    WhatsAppAutomationLog.rule_id == rule.id,
+                    WhatsAppAutomationLog.conversation_id == conversation_id,
+                    WhatsAppAutomationLog.created_at > cutoff
+                ).first()
+                
+                if recent_trigger:
+                    return False
             
-            recent_trigger = WhatsAppAutomationLog.query.filter(
-                WhatsAppAutomationLog.rule_id == rule.id,
-                WhatsAppAutomationLog.conversation_id == conversation_id,
-                WhatsAppAutomationLog.created_at > cutoff
-            ).first()
+            # Check daily limit
+            max_per_day = rule.max_triggers_per_day or 0
+            if max_per_day > 0:
+                today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+                
+                today_count = WhatsAppAutomationLog.query.filter(
+                    WhatsAppAutomationLog.rule_id == rule.id,
+                    WhatsAppAutomationLog.conversation_id == conversation_id,
+                    WhatsAppAutomationLog.created_at >= today_start
+                ).count()
+                
+                if today_count >= max_per_day:
+                    return False
             
-            if recent_trigger:
-                return False
-        
-        # Check daily limit
-        max_per_day = rule.max_triggers_per_day or 0
-        if max_per_day > 0:
-            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-            
-            today_count = WhatsAppAutomationLog.query.filter(
-                WhatsAppAutomationLog.rule_id == rule.id,
-                WhatsAppAutomationLog.conversation_id == conversation_id,
-                WhatsAppAutomationLog.created_at >= today_start
-            ).count()
-            
-            if today_count >= max_per_day:
-                return False
-        
-        return True
+            return True
+        except Exception as e:
+            logger.warning(f"Rate limit check error: {e}")
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+            return True  # On error, allow the trigger
     
     def _log_trigger(
         self,
@@ -362,6 +390,10 @@ class AutomationEngine:
             # Don't commit here - let caller handle transaction
         except Exception as e:
             logger.exception(f"Failed to log automation trigger: {e}")
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
 
 
 def check_is_first_message(conversation_id: int) -> bool:
@@ -383,6 +415,10 @@ def check_is_first_message(conversation_id: int) -> bool:
         return incoming_count <= 1
     except Exception as e:
         logger.exception(f"Error checking first message: {e}")
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
         return False
 
 
@@ -535,6 +571,10 @@ def send_automation_response(
                             db.session.commit()
                     except Exception as faq_err:
                         logger.warning(f"Failed to update FAQ match count: {faq_err}")
+                        try:
+                            db.session.rollback()
+                        except Exception:
+                            pass
         
         elif response_type == "ai":
             # AI-powered response using Gemini with RAG integration
@@ -605,4 +645,8 @@ def send_automation_response(
             
     except Exception as e:
         logger.exception(f"Failed to send automation response: {e}")
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
         return False, None, str(e)

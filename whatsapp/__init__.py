@@ -38,7 +38,6 @@ from .production_trigger_routes import production_trigger_bp
 from .drip_routes import drip_bp
 from .template_routes import template_bp
 from .interactive_automation_routes import interactive_automation_bp
-from .dataset_routes import dataset_bp
 from .models import (
     WhatsAppAccount,
     WhatsAppConversation,
@@ -65,16 +64,7 @@ from .health_check import (
 )
 
 from .bulk_routes import bulk_bp
-from .flow_routes import flow_bp
-from .flow_testing import flow_testing_bp
-from .flow_endpoint import flow_endpoint_bp
 from .coexistence_routes import coexistence_bp
-
-from .models import (
-    WhatsAppRateLimit,
-    WhatsAppHistorySyncLog,
-    WhatsAppContact,
-)
 
 __all__ = [
     "whatsapp_bp",
@@ -86,12 +76,8 @@ __all__ = [
     "trigger_bp",
     "drip_bp",
     "interactive_automation_bp",
-    "dataset_bp",
     "bulk_bp",
     "production_trigger_bp",
-    "flow_bp",
-    "flow_testing_bp",
-    "flow_endpoint_bp",
     "coexistence_bp",
     "WhatsAppAccount",
     "WhatsAppConversation",
@@ -109,9 +95,6 @@ __all__ = [
     "perform_workspace_health_check",
     "subscribe_waba_to_webhooks",
     "setup_account_after_connection",
-    "WhatsAppRateLimit",
-    "WhatsAppHistorySyncLog",
-    "WhatsAppContact",
 ]
 
-__version__ = "1.2.0"  # Added coexistence mode
+__version__ = "1.1.0"

@@ -33,6 +33,7 @@ from flask import Blueprint, request, jsonify, g, redirect, current_app
 from sqlalchemy import func, case
 
 from .services import WhatsAppService, ConversationService
+from .utils import subscribe_waba_to_app
 
 from .webhook import verify_webhook_signature, verify_webhook_challenge, WebhookProcessor
 from .services import WhatsAppService, ConversationService
@@ -47,10 +48,9 @@ from .validators import (
 )
 from .token_helper import get_account_with_token, get_valid_account_for_workspace
 from subscription.service import check_message_limit, record_message_sent
-from .models import WhatsAppAccount
+from .models import WhatsAppAccount, WhatsAppFavoriteSticker
 from models import Workspace, User
 from .ai_chatbot import get_genai_client
-from .utils import ensure_tz_aware
 
 # SECURITY: Import admin-only decorator to block agents from sensitive APIs
 from agent_backend.decorators import require_admin_only
@@ -163,27 +163,10 @@ def handle_validation_error(error: ValidationError):
 
 def _enforce_message_limit(phone_number_id):
     """
-    Check subscription limits AND coexistence rate limits for message sending.
+    Check subscription limits for message sending and record usage.
     Returns (allowed, error_response).
     """
     try:
-        # 0. Check coexistence rate limit (MPS)
-        try:
-            from .coexistence_service import CoexistenceRateLimiter
-            allowed, info = CoexistenceRateLimiter.acquire(phone_number_id)
-            if not allowed:
-                retry_after = info.get("retry_after_ms", 1000)
-                return False, jsonify({
-                    "success": False,
-                    "error": "rate_limit_exceeded",
-                    "error_code": "130429",
-                    "message": info.get("error", f"Rate limit exceeded. Retry after {retry_after}ms."),
-                    "retry_after_ms": retry_after,
-                    "mps_limit": info.get("mps_limit", 5),
-                })
-        except Exception as e:
-            logger.debug(f"Rate limit check skipped: {e}")
-        
         # 1. Resolve Account & Workspace
         account = WhatsAppAccount.query.filter_by(phone_number_id=phone_number_id).first()
         if not account:
@@ -314,6 +297,177 @@ def image_proxy():
     except Exception as e:
         logger.error(f"Image proxy error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+# ============================================================
+# Media Proxy Endpoint (for Meta CDN)
+# ============================================================
+
+@whatsapp_bp.route("/media/<media_id>", methods=["GET"])
+def proxy_media(media_id):
+    """
+    Proxy WhatsApp media from Meta CDN.
+    
+    GET /api/whatsapp/media/<media_id>?workspace_id=...
+    """
+    import requests
+    from flask import Response
+    
+    workspace_id = request.args.get("workspace_id")
+    phone_number_id = request.args.get("phone_number_id")
+    
+    logger.info(f"📁 Proxying media: id={media_id}, workspace={workspace_id}, phone={phone_number_id}")
+    
+    # Get service with proper credentials
+    service = WhatsAppService(get_db(), phone_number_id=phone_number_id, workspace_id=workspace_id)
+    
+    if not service.access_token:
+        logger.error(f"❌ WhatsApp not connected for workspace {workspace_id}")
+        return jsonify({"error": "WhatsApp not connected for this workspace"}), 401
+        
+    media_url = service.get_media_url(media_id)
+    if not media_url:
+        logger.error(f"❌ Failed to retrieve media URL from Meta for {media_id}")
+        return jsonify({"error": "Failed to retrieve media URL from Meta"}), 404
+        
+    try:
+        logger.info(f"🔗 Fetching media from Meta: {media_url[:50]}...")
+        # Fetch the actual media from Meta CDN
+        # IMPORTANT: Meta CDN URLs also require Authorization header
+        cdn_headers = {
+            "Authorization": f"Bearer {service.access_token}",
+            "User-Agent": "Sociovia/1.0"
+        }
+        resp = requests.get(media_url, headers=cdn_headers, timeout=30, stream=True)
+        
+        if resp.status_code != 200:
+            logger.error(f"❌ Meta CDN returned {resp.status_code} for {media_id}")
+            return jsonify({"error": "Failed to fetch media from CDN"}), resp.status_code
+            
+        # Return the media with proper headers
+        # We use stream_with_context or just return the response if it's small
+        return Response(
+            resp.content,
+            mimetype=resp.headers.get("Content-Type", "image/jpeg"),
+            headers={
+                "Cache-Control": "public, max-age=86400",
+                "Access-Control-Allow-Origin": "*",
+                "Content-Disposition": f'inline; filename="media_{media_id}"'
+            }
+        )
+    except Exception as e:
+        logger.error(f"🔥 Error proxying media {media_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@whatsapp_bp.route("/admin/resubscribe", methods=["POST"])
+@require_admin_only
+def resubscribe_all():
+    """
+    Trigger re-subscription for all accounts to ensure smb_message_echoes is active.
+    
+    POST /api/whatsapp/admin/resubscribe
+    """
+    success = WhatsAppService.ensure_all_waba_subscriptions()
+    return jsonify({"success": success, "message": "Re-subscription task finished."})
+
+@whatsapp_bp.route("/diag/routes", methods=["GET"])
+def diag_routes():
+    """Diagnostic route to check backend version."""
+    return jsonify({
+        "status": "ok",
+        "version": "local-debug-v1",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "endpoints": [
+            "/api/whatsapp/diag/routes",
+            "/api/whatsapp/stickers/favorite",
+            "/api/whatsapp/media/<id>"
+        ]
+    })
+
+
+@whatsapp_bp.route("/stickers/favorite", methods=["POST"])
+def favorite_sticker():
+    """
+    Save a sticker to favorites.
+    
+    POST /api/whatsapp/stickers/favorite
+    {
+        "media_id": "...",
+        "workspace_id": "...",
+        "mime_type": "...",
+        "sha256": "..."
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    media_id = data.get("media_id")
+    workspace_id = data.get("workspace_id")
+    
+    if not media_id or not workspace_id:
+        return jsonify({"error": "media_id and workspace_id required"}), 400
+        
+    # Check if already favorited
+    existing = WhatsAppFavoriteSticker.query.filter_by(
+        workspace_id=workspace_id,
+        media_id=media_id
+    ).first()
+    
+    if existing:
+        return jsonify({"success": True, "message": "Already in favorites", "id": existing.id})
+        
+    fav = WhatsAppFavoriteSticker(
+        workspace_id=workspace_id,
+        media_id=media_id,
+        mime_type=data.get("mime_type"),
+        sha256=data.get("sha256")
+    )
+    
+    db = get_db()
+    db.add(fav)
+    db.commit()
+    
+    return jsonify({"success": True, "message": "Sticker added to favorites", "id": fav.id})
+
+
+@whatsapp_bp.route("/stickers/favorite", methods=["GET"])
+def list_favorite_stickers():
+    """
+    List favorite stickers for a workspace.
+    
+    GET /api/whatsapp/stickers/favorite?workspace_id=...
+    """
+    workspace_id = request.args.get("workspace_id")
+    if not workspace_id:
+        return jsonify({"error": "workspace_id required"}), 400
+        
+    favorites = WhatsAppFavoriteSticker.query.filter_by(workspace_id=workspace_id).all()
+    return jsonify([f.to_dict() for f in favorites])
+
+
+@whatsapp_bp.route("/stickers/favorite/<int:sticker_id>", methods=["DELETE"])
+def delete_favorite_sticker(sticker_id):
+    """
+    Delete a favorite sticker.
+    
+    DELETE /api/whatsapp/stickers/favorite/<id>?workspace_id=...
+    """
+    workspace_id = request.args.get("workspace_id")
+    if not workspace_id:
+        return jsonify({"error": "workspace_id required"}), 400
+    
+    sticker = WhatsAppFavoriteSticker.query.filter_by(
+        id=sticker_id,
+        workspace_id=workspace_id
+    ).first()
+    
+    if not sticker:
+        return jsonify({"error": "Sticker not found"}), 404
+    
+    db = get_db()
+    db.delete(sticker)
+    db.commit()
+    
+    return jsonify({"success": True, "message": "Sticker removed from favorites"})
 
 
 # ============================================================
@@ -469,6 +623,55 @@ def send_text():
         return handle_validation_error(e)
     except Exception as exc:
         logger.exception(f"send_text exception: {exc}")
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@whatsapp_bp.route("/send/sticker", methods=["POST"])
+@require_token
+def send_sticker():
+    """
+    Send a sticker message.
+    
+    POST /api/whatsapp/send/sticker
+    
+    Request body:
+    {
+        "to": "919876543210",
+        "media_id": "1234567890"
+    }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        
+        # Validate required fields
+        to = data.get("to")
+        media_id = data.get("media_id")
+        
+        if not to:
+            return jsonify({"success": False, "error": "'to' is required"}), 400
+        if not media_id:
+            return jsonify({"success": False, "error": "'media_id' is required"}), 400
+        
+        phone_number_id = get_phone_number_id()
+        if not phone_number_id:
+            return jsonify({
+                "success": False,
+                "error": "phone_number_id required. Set WHATSAPP_PHONE_NUMBER_ID env var."
+            }), 400
+        
+        # Limit Check
+        allowed, error_resp = _enforce_message_limit(phone_number_id)
+        if not allowed:
+            return error_resp, 429
+        
+        # Send
+        service = WhatsAppService(get_db(), phone_number_id, g.access_token)
+        result = service.send_sticker(to=to, sticker=media_id)
+        
+        return jsonify(result), 200 if result.get("success") else 400
+        
+    except Exception as exc:
+        logger.exception(f"send_sticker exception: {exc}")
         return jsonify({"success": False, "error": str(exc)}), 500
 
 
@@ -2952,14 +3155,15 @@ def rewrite_template_for_category():
                 })
         
         # ===========================================
-        # STEP 4: Initialize Gemini AI client
+        # STEP 4: Initialize Vertex AI client (NOT free-tier)
         # ===========================================
         from google import genai
         from google.genai import types
         
-        # Check for API key first, fall back to Vertex AI project auth
-        gemini_api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        gcp_project = os.environ.get("GCP_PROJECT") or os.environ.get("PROJECT_ID")
+        # Use Vertex AI with project-based auth (not API key)
+        # Fallback chain: GCP_PROJECT -> PROJECT_ID -> hardcoded default
+        gcp_project = os.environ.get("GCP_PROJECT") or os.environ.get("PROJECT_ID") or "angular-sorter-473216-k8"
+        gcp_location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
         
         # ===========================================
         # STEP 5: Build placeholder-safe prompts
@@ -3045,25 +3249,13 @@ Return ONLY the cleaned template text. No explanations.
             
             text_model = os.environ.get("TEXT_MODEL", "gemini-2.0-flash")
             
-            # Prefer Vertex AI project auth (paid quota), fall back to API key
-            if gcp_project:
-                gcp_location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-                client = genai.Client(
-                    http_options=HttpOptions(api_version="v1"),
-                    project=gcp_project,
-                    location=gcp_location,
-                    vertexai=True,
-                )
-            elif gemini_api_key:
-                client = genai.Client(api_key=gemini_api_key)
-            else:
-                return jsonify({
-                    "success": False,
-                    "rewritten_text": None,
-                    "confidence": "LOW",
-                    "notes": "AI service not configured. Set GEMINI_API_KEY.",
-                    "cannot_rewrite": True
-                })
+            # Initialize Vertex AI client (NOT free-tier API key)
+            client = genai.Client(
+                http_options=HttpOptions(api_version="v1"),
+                project=gcp_project,
+                location=gcp_location,
+                vertexai=True,
+            )
             
             response = client.models.generate_content(
                 model=text_model,
@@ -3435,12 +3627,8 @@ def create_template():
         }), 201
         
     except Exception as e:
-        db.session.rollback()
         logger.exception(f"Template create error: {e}")
-        return jsonify({
-            "success": False, 
-            "error": str(e)
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @whatsapp_bp.route("/templates/<template_name>", methods=["GET"])
@@ -4206,7 +4394,7 @@ def get_account_diagnostics(account_id: int):
             "token_expires_at": account.token_expires_at.isoformat() if account.token_expires_at else None,
             "token_status": "valid" if has_token and (
                 account.token_type == "permanent" or 
-                (account.token_expires_at and ensure_tz_aware(account.token_expires_at) > datetime.now(timezone.utc))
+                (account.token_expires_at and account.token_expires_at > datetime.now(timezone.utc))
             ) else ("expired" if account.token_expires_at else "missing"),
             
             # Health check info
@@ -4463,7 +4651,7 @@ def connect_start():
         return jsonify({"success": False, "error": "workspace_id is required"}), 400
 
     # Use existing FB env vars (same as other Meta integrations)
-    app_id = os.getenv("FB_APP_ID") or os.getenv("META_APP_ID")
+    app_id = os.getenv("FB_APP_ID")
     config_id = os.getenv("WHATSAPP_CONFIG_ID")
     api_version = os.getenv("FB_API_VERSION", "v22.0")
     
@@ -4500,10 +4688,10 @@ def connect_popup():
     state = serializer.dumps({"workspace_id": workspace_id})
 
     # OAuth configuration
-    app_id = os.getenv("FB_APP_ID") or os.getenv("META_APP_ID")
+    app_id = os.getenv("FB_APP_ID")
     config_id = os.getenv("WHATSAPP_CONFIG_ID")
     api_version = os.getenv("FB_API_VERSION", "v22.0")
-    redirect_base = os.getenv("OAUTH_REDIRECT_BASE") or os.getenv("APP_BASE_URL", "http://localhost:5000")
+    redirect_base = os.getenv("OAUTH_REDIRECT_BASE", "https://sociovia-backend-362038465411.europe-west1.run.app")
     redirect_uri = f"{redirect_base.rstrip('/')}/api/whatsapp/connect/callback"
 
     if not app_id:
@@ -4514,7 +4702,6 @@ def connect_popup():
         "whatsapp_business_management",
         "whatsapp_business_messaging",
         "business_management",
-        "whatsapp_business_manage_events",
     ]
 
     # Build Facebook OAuth URL for WhatsApp Embedded Signup
@@ -4591,11 +4778,7 @@ def connect_exchange():
     This is called by the frontend after FB.login() returns a code.
     
     POST /api/whatsapp/connect/exchange
-    Body: { "code": "...", "workspace_id": "...", "waba_id": "...", "phone_number_id": "..." }
-    
-    waba_id and phone_number_id are optional — captured from the
-    WA_EMBEDDED_SIGNUP postMessage session info on the frontend.
-    If provided they skip the expensive /me discovery calls.
+    Body: { "code": "...", "workspace_id": "..." }
     """
     import requests as http_requests
     from .models import WhatsAppAccount
@@ -4603,9 +4786,6 @@ def connect_exchange():
     data = request.get_json(silent=True) or {}
     code = data.get("code")
     workspace_id = data.get("workspace_id")
-    # Session info from Embedded Signup postMessage (optional but preferred)
-    session_waba_id = data.get("waba_id")
-    session_phone_id = data.get("phone_number_id")
     
     if not code:
         return jsonify({"success": False, "error": "Authorization code is required"}), 400
@@ -4613,9 +4793,9 @@ def connect_exchange():
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id is required"}), 400
     
-    app_id = os.getenv("FB_APP_ID") or os.getenv("META_APP_ID")
-    app_secret = os.getenv("FB_APP_SECRET") or os.getenv("META_APP_SECRET")
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    app_id = os.getenv("FB_APP_ID")
+    app_secret = os.getenv("FB_APP_SECRET")
+    api_version = os.getenv("FB_API_VERSION", "v22.0")
     
     try:
         # Exchange code for access token (no redirect_uri needed for Embedded Signup)
@@ -4656,60 +4836,41 @@ def connect_exchange():
         except Exception as e:
             logger.warning(f"Failed to get long-lived token: {e}")
         
-        # Get WABA and phone number info
-        # Prefer session info from Embedded Signup postMessage (most reliable)
-        waba_id = session_waba_id
-        phone_number_id = session_phone_id
+        # Get WABA and phone number info using debug_token
+        waba_id = None
+        phone_number_id = None
         display_phone_number = None
         verified_name = None
         
-        # If session info provided both IDs, fetch phone details directly
-        if waba_id and phone_number_id:
-            logger.info(f"Using session info: waba_id={waba_id}, phone_number_id={phone_number_id}")
-            try:
-                phone_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/{phone_number_id}",
-                    params={
-                        "access_token": access_token,
-                        "fields": "display_phone_number,verified_name,quality_rating"
-                    },
-                    timeout=15,
-                ).json()
-                display_phone_number = phone_resp.get("display_phone_number")
-                verified_name = phone_resp.get("verified_name")
-            except Exception as e:
-                logger.warning(f"Failed to fetch phone details for {phone_number_id}: {e}")
-        
-        # Fall back to discovery via /me if session info missing
-        if not waba_id or not phone_number_id:
-            try:
-                me_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/me",
-                    params={
-                        "access_token": access_token,
-                        "fields": "id,name,businesses{id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number,verified_name,quality_rating}}}"
-                    },
-                    timeout=15,
-                ).json()
-                
-                logger.info(f"Me response: {me_resp}")
-                
-                businesses = me_resp.get("businesses", {}).get("data", [])
-                for business in businesses:
-                    wabas = business.get("owned_whatsapp_business_accounts", {}).get("data", [])
-                    for waba in wabas:
-                        waba_id = waba.get("id")
-                        phones = waba.get("phone_numbers", {}).get("data", [])
-                        if phones:
-                            phone = phones[0]
-                            phone_number_id = phone.get("id")
-                            display_phone_number = phone.get("display_phone_number")
-                            verified_name = phone.get("verified_name")
-                        break
-                    if waba_id:
-                        break
-            except Exception as e:
-                logger.warning(f"Failed to get WABA from /me: {e}")
+        # Get businesses and WhatsApp accounts
+        try:
+            me_resp = http_requests.get(
+                f"https://graph.facebook.com/{api_version}/me",
+                params={
+                    "access_token": access_token,
+                    "fields": "id,name,businesses{id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number,verified_name,quality_rating}}}"
+                },
+                timeout=15,
+            ).json()
+            
+            logger.info(f"Me response: {me_resp}")
+            
+            businesses = me_resp.get("businesses", {}).get("data", [])
+            for business in businesses:
+                wabas = business.get("owned_whatsapp_business_accounts", {}).get("data", [])
+                for waba in wabas:
+                    waba_id = waba.get("id")
+                    phones = waba.get("phone_numbers", {}).get("data", [])
+                    if phones:
+                        phone = phones[0]
+                        phone_number_id = phone.get("id")
+                        display_phone_number = phone.get("display_phone_number")
+                        verified_name = phone.get("verified_name")
+                    break
+                if waba_id:
+                    break
+        except Exception as e:
+            logger.warning(f"Failed to get WABA from /me: {e}")
         
         # Try debug_token if no WABA found
         if not waba_id:
@@ -4802,14 +4963,6 @@ def connect_exchange():
             logger.info(f"Phone registration response: {register_resp.json()}")
         except Exception as e:
             logger.warning(f"Phone registration failed (may already be registered): {e}")
-        
-        # Subscribe WABA to app webhooks (critical for receiving incoming messages)
-        try:
-            from .connection_path import _run_post_connection_setup
-            setup_result = _run_post_connection_setup(account.id, waba_id, access_token)
-            logger.info(f"Post-connection setup result: {setup_result}")
-        except Exception as e:
-            logger.warning(f"Post-connection setup warning: {e}")
         
         return jsonify({
             "success": True,
@@ -4925,12 +5078,7 @@ def facebook_oauth_login():
         if not long_token:
             return jsonify({"success": False, "error": "Token exchange returned no token"}), 500
         
-        # Calculate expiration datetime
-        token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in) if expires_in else None
-        # Determine token type based on expiration
-        actual_token_type = "long_lived" if expires_in else "permanent"
-        
-        logger.info(f"Facebook OAuth login successful for user {user_id}, workspace {workspace_id}, token_type={actual_token_type}, expires_in={expires_in}s")
+        logger.info(f"Facebook OAuth login successful for user {user_id}, workspace {workspace_id}")
         
         # ============================================================
         # AUTO-DISCOVER WABA AND PHONE NUMBERS
@@ -5022,7 +5170,7 @@ def facebook_oauth_login():
             
             if existing:
                 existing.workspace_id = workspace_id
-                existing.set_access_token(long_token, token_type=actual_token_type, expires_at=token_expires_at)
+                existing.set_access_token(long_token, token_type="permanent")
                 existing.is_active = True
                 existing.display_phone_number = display_phone_number
                 existing.verified_name = verified_name
@@ -5038,7 +5186,7 @@ def facebook_oauth_login():
                     connected_by_user_id=user_id,
                     is_active=True,
                 )
-                account.set_access_token(long_token, token_type=actual_token_type, expires_at=token_expires_at)
+                account.set_access_token(long_token, token_type="permanent")
                 get_db().add(account)
             
             get_db().commit()
@@ -5074,9 +5222,8 @@ def facebook_oauth_login():
                     "display_phone_number": account.display_phone_number,
                     "verified_name": account.verified_name,
                 },
-                "token_type": actual_token_type,
+                "access_token": long_token,
                 "expires_in": expires_in,
-                "expires_at": token_expires_at.isoformat() if token_expires_at else None,
             })
         
         # No WABA found - return token for manual linking
@@ -5476,6 +5623,12 @@ def connect_callback():
         
         logger.info(f"WhatsApp account connected: phone_number_id={account.phone_number_id}")
         
+        # Subscribe WABA to app for webhooks (messages, template updates, etc.)
+        try:
+            subscribe_waba_to_app(account.waba_id, access_token)
+        except Exception as e:
+            logger.warning(f"Initial webhook subscription failed for WABA {account.waba_id}: {e}")
+        
         # ============================================================
         # AUTO-REGISTER PHONE NUMBER WITH WHATSAPP BUSINESS API
         # This is required before the phone can send/receive messages
@@ -5502,14 +5655,6 @@ def connect_callback():
         except Exception as reg_error:
             # Don't fail the OAuth if registration fails - it might already be registered
             logger.warning(f"Phone registration warning (may already be registered): {reg_error}")
-        
-        # Subscribe WABA to app webhooks (critical for receiving incoming messages)
-        try:
-            from .connection_path import _run_post_connection_setup
-            setup_result = _run_post_connection_setup(account.id, waba_id, access_token)
-            logger.info(f"Post-connection setup (callback) result: {setup_result}")
-        except Exception as e:
-            logger.warning(f"Post-connection setup warning: {e}")
         
         return _render_oauth_response(frontend_url, {
             "type": "sociovia_oauth_complete",
@@ -5792,6 +5937,8 @@ def send_notification_message():
 # ============================================================
 
 @whatsapp_bp.route("/media/upload", methods=["POST", "OPTIONS"])
+@whatsapp_bp.route("/media/upload/public", methods=["POST", "OPTIONS"])
+@whatsapp_bp.route("/media/upload/url", methods=["POST", "OPTIONS"])
 def upload_chat_media():
     """
     Upload media files (images, videos, documents) for WhatsApp chat messages.
@@ -5896,6 +6043,47 @@ def upload_chat_media():
                 "max_size_bytes": max_size
             }), 400
         
+        # Convert WebP/GIF to JPEG for WhatsApp compatibility
+        # WhatsApp Cloud API only supports JPEG and PNG for images
+        file_data = None
+        if content_type in ('image/webp', 'image/gif'):
+            try:
+                from PIL import Image
+                from io import BytesIO
+                
+                # Read the image
+                img = Image.open(file.stream)
+                
+                # Convert to RGB (WebP/GIF might have alpha channel or palette)
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    # Create white background for transparency
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    if img.mode == 'P':
+                        img = img.convert('RGBA')
+                    background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                    img = background
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Save as JPEG
+                output = BytesIO()
+                img.save(output, format='JPEG', quality=90)
+                output.seek(0)
+                file_data = output
+                
+                # Update metadata
+                content_type = 'image/jpeg'
+                original_filename = os.path.splitext(original_filename)[0] + '.jpg'
+                file_size = len(output.getvalue())
+                
+                logger.info(f"Converted {file.content_type} to JPEG for WhatsApp compatibility")
+            except Exception as conv_err:
+                logger.warning(f"Failed to convert image: {conv_err}, uploading original")
+                file.seek(0)
+                file_data = file.stream
+        else:
+            file_data = file.stream
+        
         # Get S3/Spaces config
         SPACE_NAME = os.environ.get("SPACE_NAME") or os.environ.get("DO_SPACES_BUCKET")
         SPACE_REGION = os.environ.get("SPACE_REGION") or os.environ.get("DO_SPACES_REGION")
@@ -5924,7 +6112,7 @@ def upload_chat_media():
         # Upload to Spaces
         try:
             s3_client.upload_fileobj(
-                file.stream,
+                file_data,
                 SPACE_NAME,
                 key,
                 ExtraArgs={
@@ -5940,6 +6128,7 @@ def upload_chat_media():
             return jsonify({
                 "success": True,
                 "public_url": public_url,
+                "url": public_url,  # Alias for compatibility
                 "media_type": media_type,
                 "filename": original_filename,
                 "size": file_size,

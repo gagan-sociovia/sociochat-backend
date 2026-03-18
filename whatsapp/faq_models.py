@@ -16,7 +16,7 @@ from typing import Dict, Any, List, Optional
 
 from models import db
 from sqlalchemy import func
-from sqlalchemy import JSON as JSONB  # Use generic JSON for SQLite compatibility
+from sqlalchemy.dialects.postgresql import JSONB
 
 
 class WhatsAppFAQ(db.Model):

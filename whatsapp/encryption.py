@@ -27,7 +27,7 @@ def get_encryption_key() -> bytes:
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=b'sociochat_wa_salt',  # Fixed salt for consistency
+            salt=b'sociovia_wa_salt',  # Fixed salt for consistency
             iterations=100000,
         )
         key = base64.urlsafe_b64encode(kdf.derive(secret.encode()))

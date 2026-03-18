@@ -23,13 +23,10 @@ All functions:
 import os
 import logging
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
 import requests
-from models import db
-from .models import WhatsAppAccount, WhatsAppTemplate, MessageType
-from .utils import ensure_tz_aware
 
 from models import db
 from .models import (
@@ -38,7 +35,7 @@ from .models import (
     WhatsAppMessage,
     WhatsAppTemplate,
 )
-from .utils import normalize_phone as _normalize_phone_util
+from .utils import normalize_phone as _normalize_phone_util, subscribe_waba_to_app
 from notifications import notification_manager
 
 logger = logging.getLogger(__name__)
@@ -132,12 +129,54 @@ class WhatsAppService:
         """
         Send request to WhatsApp Cloud API.
         
+        Includes rate limiting for coexistence accounts (5 MPS).
+        
         Args:
             payload: Message payload
             
         Returns:
             API response dict with success status
         """
+        # Rate limiting: check if this account has rate limits
+        try:
+            from .rate_limiter import get_rate_limiter
+            from .models import WhatsAppAccount as _WA
+            
+            account = _WA.query.filter_by(
+                phone_number_id=self.phone_number_id,
+                is_active=True,
+            ).first()
+            
+            if account:
+                limiter = get_rate_limiter()
+                mps = account.mps_limit or (5 if account.is_coexistence else 80)
+                
+                if not limiter.acquire(self.phone_number_id, mps):
+                    # Wait and retry once
+                    import time
+                    wait = limiter.wait_time(self.phone_number_id, mps)
+                    if wait > 0 and wait < 5:  # Don't wait more than 5 seconds
+                        time.sleep(wait)
+                        if not limiter.acquire(self.phone_number_id, mps):
+                            logger.warning(f"Rate limited: {self.phone_number_id} (mps={mps})")
+                            return {
+                                "success": False,
+                                "error": "Rate limit exceeded. Please try again shortly.",
+                                "error_code": "130429",
+                                "retry_after": limiter.wait_time(self.phone_number_id, mps),
+                            }
+                    else:
+                        return {
+                            "success": False,
+                            "error": "Rate limit exceeded. Please try again shortly.",
+                            "error_code": "130429",
+                            "retry_after": wait,
+                        }
+        except ImportError:
+            pass  # Rate limiter not available, proceed without
+        except Exception as e:
+            logger.warning(f"Rate limiter check failed (non-fatal): {e}")
+        
         try:
             logger.info(f"Sending WhatsApp API request to {self.api_url}")
             logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
@@ -185,6 +224,87 @@ class WhatsAppService:
             logger.exception(f"Unexpected error: {e}")
             return {"success": False, "error": str(e)}
     
+    def get_media_url(self, media_id: str) -> Optional[str]:
+        """
+        Get temporary media URL from Meta given a media ID.
+        
+        Args:
+            media_id: WhatsApp media ID
+            
+        Returns:
+            Temporary URL string or None
+        """
+        try:
+            url = f"{WHATSAPP_API_BASE}/{self.api_version}/{media_id}"
+            resp = requests.get(url, headers=self.headers, timeout=20)
+            data = resp.json()
+            
+            if resp.status_code == 200:
+                return data.get("url")
+            else:
+                logger.error(f"Failed to get media URL for {media_id}: {data}")
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching media URL for {media_id}: {e}")
+            return None
+
+    def send_sticker(self, to: str, sticker: str) -> Dict[str, Any]:
+        """
+        Send a sticker message.
+        
+        Args:
+            to: Recipient phone number
+            sticker: Sticker ID or URL
+            
+        Returns:
+            API response dict with message details
+        """
+        to = self._normalize_phone(to)
+        
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "sticker",
+            "sticker": {}
+        }
+        
+        sticker_url = None
+        sticker_id = None
+        if sticker.startswith("http"):
+            payload["sticker"]["link"] = sticker
+            sticker_url = sticker
+        else:
+            payload["sticker"]["id"] = sticker
+            sticker_id = sticker
+        
+        # Get or create conversation
+        conversation = self._get_or_create_conversation(to)
+        
+        # Send via API
+        result = self._send_api_request(payload)
+        
+        # Store message in DB
+        message = self._store_outgoing_message(
+            conversation=conversation,
+            message_type="sticker",
+            content={
+                "media_type": "sticker",
+                "url": sticker_url,
+                "id": sticker_id,
+            },
+            wamid=result.get("wamid"),
+            status="sent" if result.get("success") else "failed",
+            error_code=str(result.get("error_code")) if result.get("error_code") else None,
+            error_message=result.get("error") if not result.get("success") else None,
+        )
+        
+        result["message_id"] = message.id
+        result["conversation_id"] = conversation.id
+        result["message"] = message.to_dict()
+        
+        return result
+
     def _get_or_create_conversation(
         self,
         user_phone: str,
@@ -255,6 +375,33 @@ class WhatsAppService:
             logger.info(f"Created new WhatsApp account: {self.phone_number_id}")
         
         return account
+
+    @staticmethod
+    def ensure_all_waba_subscriptions():
+        """
+        Startup task to ensure ALL active WhatsApp accounts are subscribed to the app.
+        This fixes stale or missing subscriptions in production without manual intervention.
+        """
+        from .models import WhatsAppAccount
+        from .utils import subscribe_waba_to_app
+        
+        try:
+            active_accounts = WhatsAppAccount.query.filter_by(is_active=True).all()
+            logger.info(f"Startup: Ensuring webhook subscriptions for {len(active_accounts)} active WABAs.")
+            
+            for account in active_accounts:
+                token = account.get_access_token()
+                if not token:
+                    continue
+                
+                # We skip if this was already done very recently (optional optimization)
+                # For now, we perform it to be sure.
+                subscribe_waba_to_app(account.waba_id, token)
+                
+            return True
+        except Exception as e:
+            logger.error(f"Failed to ensure all WABA subscriptions: {e}")
+            return False
     
     
     # ============================================================
@@ -548,9 +695,8 @@ class WhatsAppService:
             # Track approval time if status changed from PENDING to APPROVED
             if old_status == "PENDING" and template.status == "APPROVED" and template.submitted_at:
                 template.approved_at = datetime.now(timezone.utc)
-                submitted_at = ensure_tz_aware(template.submitted_at)
                 template.approval_duration_seconds = int(
-                    (template.approved_at - submitted_at).total_seconds()
+                    (template.approved_at - template.submitted_at).total_seconds()
                 )
             
             self.db_session.commit()
@@ -850,12 +996,17 @@ class WhatsAppService:
             template_obj["components"] = final_components
             
         # Helper: Check if we have named params wrapper from validator or direct call
-        # Structure: [{"type": "body", "named_params": {"name": "John"}}]
+        # Structure: [{"type": "body", "named_params": {"name": "John"}}, {"type": "header", "parameters": [...]}]
         named_params = None
+        other_components = []
         has_parameter_name_in_params = False
         
-        if components and len(components) == 1 and components[0].get("named_params"):
-            named_params = components[0].get("named_params")
+        if components:
+            for comp in components:
+                if comp.get("named_params"):
+                    named_params = comp.get("named_params")
+                elif comp.get("parameters"):
+                    other_components.append(comp)
         
         # Also check if components already have parameter_name in their parameters
         # This happens when drip engine passes components with named params
@@ -872,13 +1023,38 @@ class WhatsAppService:
         if named_params:
             from .template_builder import TemplateBuilder
             builder = TemplateBuilder(template_name, language_code)
+            
+            # Apply named body params
             builder.add_named_body_params(named_params)
+            
+            # Apply other components (headers, buttons, etc.)
+            for comp in other_components:
+                comp_type = comp.get("type", "").lower()
+                params = comp.get("parameters", [])
+                
+                if comp_type == "header" and params:
+                    p = params[0]
+                    p_type = p.get("type", "").lower()
+                    if p_type == "image":
+                        builder.add_header_image(p.get("image", {}).get("link", ""))
+                    elif p_type == "video":
+                        builder.add_header_video(p.get("video", {}).get("link", ""))
+                    elif p_type == "document":
+                        builder.add_header_document(
+                            p.get("document", {}).get("link", ""),
+                            filename=p.get("document", {}).get("filename")
+                        )
+                    elif p_type == "text":
+                        builder.add_header_text(p.get("text", ""))
+                
+                # Note: Buttons are usually auto-detected from body_params in TemplateBuilder
+                # or manually added. Support for manual button components can be added if needed.
             
             # Re-build payload using builder
             payload = builder.build_with_recipient(to)
             
-            # Since builder handles everything, we skip the manual construction below
-            # But we need to ensure consistent return structure
+            # Update template_obj for storage logging consistency
+            template_obj = payload.get("template", template_obj)
         elif has_parameter_name_in_params:
             # Components already have parameter_name in them - use them directly
             # This is the proper named parameters format for Meta API
@@ -953,7 +1129,7 @@ class WhatsAppService:
         
         result["message_id"] = message.id
         result["conversation_id"] = conversation.id
-        result["message"] = message.to_dict()  # Full message object for frontend inbox
+        result["message"] = message.to_dict()
         result["payload_sent"] = payload  # Return payload for debugging
         
         # Broadcast via SSE for real-time inbox update
@@ -967,9 +1143,7 @@ class WhatsAppService:
                     "message": message.to_dict(),
                     "conversation_id": conversation.id,
                     "account_id": account.id if account else None,
-                    "workspace_id": workspace_id,
-                    "user_phone": conversation.user_phone,
-                    "user_name": conversation.user_name
+                    "workspace_id": workspace_id
                 })
                 logger.info(f"Broadcasted template message: {message.id}")
             except Exception as e:
@@ -1086,6 +1260,7 @@ class WhatsAppService:
         
         result["message_id"] = message.id
         result["conversation_id"] = conversation.id
+        result["message"] = message.to_dict()
         result["payload_sent"] = payload
         
         # Broadcast via SSE for real-time inbox update
@@ -1255,6 +1430,10 @@ class WhatsAppService:
         body_text: str,
         buttons: List[Dict[str, str]],
         header_text: Optional[str] = None,
+        header_image_url: Optional[str] = None,
+        header_video_url: Optional[str] = None,
+        header_document_url: Optional[str] = None,
+        header_document_filename: Optional[str] = None,
         footer_text: Optional[str] = None,
         waba_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -1265,7 +1444,11 @@ class WhatsAppService:
             to: Recipient phone number
             body_text: Message body text
             buttons: List of button dicts [{"id": "btn1", "title": "Button 1"}, ...]
-            header_text: Optional header
+            header_text: Optional text header
+            header_image_url: Optional image URL for header (takes priority over text)
+            header_video_url: Optional video URL for header
+            header_document_url: Optional document URL for header
+            header_document_filename: Filename for document header
             footer_text: Optional footer
             waba_id: Optional WABA ID override
             
@@ -1308,8 +1491,35 @@ class WhatsAppService:
             "action": {"buttons": formatted_buttons},
         }
         
-        if header_text:
+        # Header support: image > video > document > text (priority order)
+        header_type = None
+        print(f"[DEBUG] send_interactive_buttons header params:")
+        print(f"        header_image_url: {header_image_url}")
+        print(f"        header_video_url: {header_video_url}")
+        print(f"        header_document_url: {header_document_url}")
+        print(f"        header_text: {header_text}")
+        
+        if header_image_url:
+            interactive["header"] = {"type": "image", "image": {"link": header_image_url}}
+            header_type = "image"
+            print(f"        -> Using IMAGE header: {header_image_url}")
+        elif header_video_url:
+            interactive["header"] = {"type": "video", "video": {"link": header_video_url}}
+            header_type = "video"
+            print(f"        -> Using VIDEO header: {header_video_url}")
+        elif header_document_url:
+            doc_header = {"link": header_document_url}
+            if header_document_filename:
+                doc_header["filename"] = header_document_filename
+            interactive["header"] = {"type": "document", "document": doc_header}
+            header_type = "document"
+            print(f"        -> Using DOCUMENT header: {header_document_url}")
+        elif header_text:
             interactive["header"] = {"type": "text", "text": header_text}
+            header_type = "text"
+            print(f"        -> Using TEXT header: {header_text}")
+        else:
+            print(f"        -> NO header")
         
         if footer_text:
             interactive["footer"] = {"text": footer_text}
@@ -1336,6 +1546,11 @@ class WhatsAppService:
                 "interactive_type": "button",
                 "body": body_text,
                 "header": header_text,
+                "header_type": header_type,
+                "header_image_url": header_image_url,
+                "header_video_url": header_video_url,
+                "header_document_url": header_document_url,
+                "header_document_filename": header_document_filename,
                 "footer": footer_text,
                 "buttons": buttons,
             },
@@ -1347,6 +1562,7 @@ class WhatsAppService:
         
         result["message_id"] = message.id
         result["conversation_id"] = conversation.id
+        result["message"] = message.to_dict()
         
         return result
     
@@ -1426,6 +1642,7 @@ class WhatsAppService:
         
         result["message_id"] = message.id
         result["conversation_id"] = conversation.id
+        result["message"] = message.to_dict()
         
         return result
     
@@ -1805,7 +2022,7 @@ class WhatsAppService:
     # Meta API Integration (Phase 3)
     # ============================================================
 
-    def resumable_media_upload(self, file_path: str, mime_type: str, app_id: Optional[str] = None) -> Optional[str]:
+    def resumable_media_upload(self, file_path: str, mime_type: str, app_id: Optional[str] = None, access_token: Optional[str] = None) -> Optional[str]:
         """
         Perform a Resumable Upload to get a media handle (h).
         Steps:
@@ -1818,12 +2035,13 @@ class WhatsAppService:
              return None
 
         # Config
-        target_app_id = app_id or os.getenv("META_APP_ID")
-        access_token = os.getenv("WHATSAPP_ACCESS_TOKEN") # Or account specific token logic
+        target_app_id = app_id or os.getenv("META_APP_ID") or os.getenv("FB_APP_ID")
+        if not access_token:
+            access_token = os.getenv("WHATSAPP_ACCESS_TOKEN")
         file_size = os.path.getsize(file_path)
         
         if not target_app_id or not access_token:
-            logger.error("Missing App ID or Access Token for upload")
+            logger.error("Missing App ID or Access Token for upload. META_APP_ID/FB_APP_ID=%s, token=%s", target_app_id, bool(access_token))
             return None
 
         # Step 1: Create Session
@@ -2301,13 +2519,13 @@ def send_interactive_message(
 
     def get_oauth_url(self, workspace_id: str) -> str:
         """Generate the Meta Embedded Signup URL."""
-        app_id = os.getenv("META_APP_ID")
+        app_id = os.getenv("META_APP_ID") or os.getenv("FB_APP_ID")
         # Ensure base URL doesn't have trailing slash
         base_url = os.getenv("APP_BASE_URL", "https://sociovia-backend-362038465411.europe-west1.run.app").rstrip("/")
         redirect_uri = f"{base_url}/api/whatsapp/connect/callback"
         
         if not app_id:
-            raise ValueError("META_APP_ID environment variable not set")
+            raise ValueError("META_APP_ID or FB_APP_ID environment variable not set")
 
         # Scopes required for BSP/Embedded Signup
         scopes = "whatsapp_business_management,whatsapp_business_messaging"
@@ -2323,8 +2541,8 @@ def send_interactive_message(
 
     def connect_account(self, code: str, workspace_id: str):
         """Exchange code for token and store account details."""
-        app_id = os.getenv("META_APP_ID")
-        app_secret = os.getenv("META_APP_SECRET")
+        app_id = os.getenv("META_APP_ID") or os.getenv("FB_APP_ID")
+        app_secret = os.getenv("META_APP_SECRET") or os.getenv("FB_APP_SECRET")
         base_url = os.getenv("APP_BASE_URL", "https://sociovia-backend-362038465411.europe-west1.run.app").rstrip("/")
         redirect_uri = f"{base_url}/api/whatsapp/connect/callback"
 
@@ -2442,13 +2660,5 @@ def send_interactive_message(
         except Exception as reg_error:
             # Don't fail if registration fails - phone might already be registered
             logger.warning(f"Phone registration warning (may already be registered): {reg_error}")
-        
-        # Subscribe WABA to app webhooks (critical for receiving incoming messages)
-        try:
-            from .connection_path import _run_post_connection_setup
-            setup_result = _run_post_connection_setup(account.id, waba_id, access_token)
-            logger.info(f"Post-connection setup (connect_account) result: {setup_result}")
-        except Exception as e:
-            logger.warning(f"Post-connection setup warning: {e}")
         
         return account

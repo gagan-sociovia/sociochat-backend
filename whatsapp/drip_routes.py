@@ -93,69 +93,32 @@ def get_gspread_client():
         return None, f"Failed to authorize: {e}"
 
 
+def _clean_row_data(row_data: dict) -> dict:
+    """
+    Clean a row dict: trim whitespace from keys AND values.
+    Ensures consistent column names and data across all import sources.
+    """
+    cleaned = {}
+    for key, val in row_data.items():
+        clean_key = key.strip() if isinstance(key, str) else key
+        if isinstance(val, str):
+            cleaned[clean_key] = val.strip()
+        else:
+            cleaned[clean_key] = val
+    return cleaned
+
+
 def normalize_phone_number(phone_value) -> str:
     """
     Normalize phone number from various formats to a clean format.
-    Handles: scientific notation (9.19E+11), spaces, dashes, parentheses, +, etc.
-    Auto-adds 91 country code for 10-digit Indian numbers.
+    Delegates to the canonical normalize_phone_robust() from utils.
     
     Returns: normalized phone string or empty string if invalid
     """
-    import re
+    from .utils import normalize_phone_robust
     
-    if phone_value is None:
-        return ""
-    
-    phone_str = str(phone_value).strip()
-    
-    if not phone_str:
-        return ""
-    
-    # Handle scientific notation (e.g., 9.19E+11, 9.16E+11)
-    if 'e' in phone_str.lower() or 'E' in phone_str:
-        try:
-            # Convert scientific notation to integer
-            phone_num = int(float(phone_str))
-            phone_str = str(phone_num)
-        except (ValueError, OverflowError):
-            pass
-    
-    # Handle float with decimal (e.g., "9390000000.0")
-    if '.' in phone_str:
-        try:
-            phone_num = int(float(phone_str))
-            phone_str = str(phone_num)
-        except (ValueError, OverflowError):
-            # If conversion fails, just strip after decimal
-            phone_str = phone_str.split('.')[0]
-    
-    # Remove all non-digit characters except +
-    phone_str = re.sub(r'[^\d+]', '', phone_str)
-    
-    # Remove leading + if present, we'll handle country code separately
-    if phone_str.startswith('+'):
-        phone_str = phone_str[1:]
-    
-    # Skip invalid numbers
-    if len(phone_str) < 10:
-        logger.warning(f"Phone number too short after normalization: {phone_str}")
-        return ""
-    
-    # If exactly 10 digits, assume Indian number and add 91
-    if len(phone_str) == 10:
-        phone_str = "91" + phone_str
-    
-    # If starts with 0, remove it (some formats use 0 prefix)
-    if phone_str.startswith('0'):
-        phone_str = phone_str[1:]
-        # If now 10 digits, add 91
-        if len(phone_str) == 10:
-            phone_str = "91" + phone_str
-    
-    # Log normalization for debugging
-    logger.debug(f"Normalized phone: {phone_value} -> {phone_str}")
-    
-    return phone_str
+    result = normalize_phone_robust(phone_value)
+    return result if result else ""
 
 
 # ============================================================
@@ -620,11 +583,12 @@ def dataset_import_csv(dataset_id: int):
         columns = []
         
         for row in reader:
+            cleaned = _clean_row_data(dict(row))
             if not columns:
-                columns = list(row.keys())
+                columns = list(cleaned.keys())
                 dataset.columns = columns
             
-            row_obj = WhatsAppDatasetRow(dataset_id=dataset_id, data=dict(row))
+            row_obj = WhatsAppDatasetRow(dataset_id=dataset_id, data=cleaned)
             db.session.add(row_obj)
             rows_added += 1
         
@@ -677,7 +641,8 @@ def dataset_upload_mapped(dataset_id: int):
             WhatsAppDatasetRow.query.filter_by(dataset_id=dataset_id).delete()
             
         rows_added = 0
-        dataset.columns = list(column_mapping.values()) if column_mapping else (reader.fieldnames or [])
+        raw_cols = list(column_mapping.values()) if column_mapping else (reader.fieldnames or [])
+        dataset.columns = [c.strip() if isinstance(c, str) else c for c in raw_cols]
         dataset.column_mapping = column_mapping
         
         for row in reader:
@@ -689,7 +654,7 @@ def dataset_upload_mapped(dataset_id: int):
                 target_col = column_mapping.get(csv_col, csv_col)
                 row_data[target_col] = val
                 
-            row_obj = WhatsAppDatasetRow(dataset_id=dataset_id, data=row_data)
+            row_obj = WhatsAppDatasetRow(dataset_id=dataset_id, data=_clean_row_data(row_data))
             db.session.add(row_obj)
             rows_added += 1
         
@@ -755,13 +720,14 @@ def dataset_import_sheets(dataset_id: int):
         if not all_values:
             return jsonify({"success": False, "error": "Sheet is empty"}), 400
             
-        headers = all_values[0]
+        headers = [h.strip() if isinstance(h, str) else h for h in all_values[0]]
         data_rows = all_values[1:]
         
         if replace:
             WhatsAppDatasetRow.query.filter_by(dataset_id=dataset_id).delete()
             
-        dataset.columns = list(column_mapping.values()) if column_mapping else headers
+        clean_mapped_cols = [v.strip() if isinstance(v, str) else v for v in column_mapping.values()] if column_mapping else headers
+        dataset.columns = clean_mapped_cols
         dataset.source_type = "google_sheets"
         dataset.source_config = {
             "sheet_id": sheet_id,
@@ -786,7 +752,7 @@ def dataset_import_sheets(dataset_id: int):
             else:
                 final_data = row_dict
                 
-            row_obj = WhatsAppDatasetRow(dataset_id=dataset_id, data=final_data)
+            row_obj = WhatsAppDatasetRow(dataset_id=dataset_id, data=_clean_row_data(final_data))
             db.session.add(row_obj)
             rows_added += 1
             
@@ -874,7 +840,7 @@ def dataset_import_crm(dataset_id: int):
                     val = getattr(record, col, None)
                     row_data[col] = str(val) if val is not None else ""
             
-            row_obj = WhatsAppDatasetRow(dataset_id=dataset_id, data=row_data)
+            row_obj = WhatsAppDatasetRow(dataset_id=dataset_id, data=_clean_row_data(row_data))
             db.session.add(row_obj)
             rows_added += 1
         
@@ -1114,59 +1080,6 @@ def preview_crm_data():
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id is required"}), 400
     
-    # ── External Sociovia CRM (crm_url provided) ──
-    crm_url = data.get("crm_url", "").strip()
-    if crm_url:
-        try:
-            import requests as http_req
-            # Map normalized entity_type back to API resource name
-            api_source = "contacts" if entity_type == "contact" else "leads" if entity_type == "lead" else entity_type
-            endpoint = f"{crm_url.rstrip('/')}/api/{api_source}"
-            params = {"workspace_id": workspace_id, "per_page": "500"}
-
-            resp = http_req.get(endpoint, params=params, timeout=15)
-            resp.raise_for_status()
-            api_data = resp.json()
-
-            # Normalize response shape
-            if api_source == "contacts":
-                records = api_data.get("data", [])
-            else:
-                records = api_data if isinstance(api_data, list) else api_data.get("data", [])
-
-            if not records:
-                return jsonify({
-                    "success": True,
-                    "fields": ["name", "email", "phone", "company", "source", "status"],
-                    "headers": ["name", "email", "phone", "company", "source", "status"],
-                    "preview_rows": [],
-                    "total_records": 0,
-                    "type": api_source,
-                })
-
-            fields = list(records[0].keys())
-            exclude = {"id", "workspace_id", "user_id", "details", "created_at", "updated_at"}
-            fields = [f for f in fields if f not in exclude]
-
-            preview_rows = []
-            for rec in records:
-                row = {f: str(rec.get(f, "") or "") for f in fields}
-                preview_rows.append(row)
-
-            total = api_data.get("meta", {}).get("total", len(records)) if api_source == "contacts" else len(records)
-
-            return jsonify({
-                "success": True,
-                "fields": fields,
-                "headers": fields,
-                "preview_rows": preview_rows,
-                "total_records": total,
-                "type": api_source,
-            })
-        except Exception as e:
-            logger.warning("External Sociovia CRM API call failed: %s", e)
-            return jsonify({"success": False, "error": f"Failed to connect to Sociovia CRM: {str(e)}"}), 502
-
     try:
         from flask import current_app
         
@@ -1344,13 +1257,14 @@ def preview_csv_data():
         if not rows:
             return jsonify({"success": False, "error": "Empty CSV file"}), 400
         
-        columns = rows[0]
+        columns = [c.strip() for c in rows[0]]  # Trim column headers
         # Build preview_rows as list of dicts
         preview_rows = []
         for row in rows[1:6]:
             row_dict = {}
             for i, col in enumerate(columns):
-                row_dict[col] = row[i] if i < len(row) else ''
+                val = row[i] if i < len(row) else ''
+                row_dict[col] = val.strip() if isinstance(val, str) else val
             preview_rows.append(row_dict)
         
         return jsonify({
@@ -2633,10 +2547,17 @@ def enroll_dataset(account_id: int, campaign_id: int, account: WhatsAppAccount, 
         rows = WhatsAppDatasetRow.query.filter_by(dataset_id=dataset_id).all()
         
         for row_obj in rows:
-            row_data = row_obj.data or {}
+            row_data = _clean_row_data(row_obj.data or {})
             
-            # Get phone
+            # Get phone — try exact column, then trimmed match
             raw_phone = row_data.get(phone_col, "")
+            if not raw_phone:
+                # Fallback: try trimmed column name match
+                phone_col_trimmed = phone_col.strip() if isinstance(phone_col, str) else phone_col
+                for k, v in row_data.items():
+                    if k.strip() == phone_col_trimmed:
+                        raw_phone = v
+                        break
             raw_phone_str = str(raw_phone)
             if raw_phone_str.endswith(".0"):
                 raw_phone_str = raw_phone_str[:-2]
@@ -2666,20 +2587,34 @@ def enroll_dataset(account_id: int, campaign_id: int, account: WhatsAppAccount, 
                     val = None
                     if dataset_col and dataset_col in row_data:
                         val = row_data[dataset_col]
+                    elif dataset_col:
+                        # Fallback: try trimmed column match
+                        dc_trimmed = dataset_col.strip() if isinstance(dataset_col, str) else dataset_col
+                        for k, v in row_data.items():
+                            if k.strip() == dc_trimmed:
+                                val = v
+                                break
                     
                     if val is not None and str(val).strip():
-                        variables[variable_key] = str(val)
+                        variables[variable_key] = str(val).strip()
             
             # 2. Apply fallbacks for missing keys - iterate over known fallbacks
-            # We should technically iterate over expected schema, but fallback_values often covers it
             if fallback_values:
                 for var_key, default_val in fallback_values.items():
                     if var_key not in variables or not variables[var_key]:
                         variables[var_key] = str(default_val)
             
             # 3. Add name if mapped
-            if name_col and name_col in row_data:
-                 variables["name"] = row_data[name_col]
+            name_val = row_data.get(name_col, "") if name_col else ""
+            if not name_val and name_col:
+                # Trimmed fallback
+                nc_trimmed = name_col.strip() if isinstance(name_col, str) else name_col
+                for k, v in row_data.items():
+                    if k.strip() == nc_trimmed:
+                        name_val = v
+                        break
+            if name_val:
+                variables["name"] = str(name_val).strip()
 
             next_run = None
             if first_step:

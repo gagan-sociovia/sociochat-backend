@@ -196,7 +196,10 @@ def subscribe_waba_to_webhooks(waba_id: str, access_token: str) -> Tuple[bool, s
     """
     Subscribe WABA to receive webhooks for this app.
     
-    This is CRITICAL for receiving incoming messages!
+    This is CRITICAL for receiving incoming messages AND template status updates!
+    
+    Without explicit subscribed_fields, Meta only sends 'messages' events.
+    We need template status events for auto-updating approval/rejection status.
     
     Returns:
         (success, message, details)
@@ -204,11 +207,30 @@ def subscribe_waba_to_webhooks(waba_id: str, access_token: str) -> Tuple[bool, s
     if not waba_id or not access_token:
         return False, "Missing WABA ID or access token", {}
     
+    # All webhook fields we need to subscribe to
+    # - messages: incoming messages & delivery status
+    # - message_template_status_update: template approval/rejection
+    # - message_template_quality_update: template quality score changes
+    # - template_category_update: template category changes
+    # - message_echoes: messages sent from mobile (coexistence)
+    subscribed_fields = [
+        "messages",
+        "message_template_status_update",
+        "message_template_quality_update",
+        "template_category_update",
+        "message_echoes",
+    ]
+    
     try:
         url = f"{META_GRAPH_API}/{waba_id}/subscribed_apps"
-        headers = {"Authorization": f"Bearer {access_token}"}
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
         
-        response = requests.post(url, headers=headers, timeout=10)
+        response = requests.post(url, headers=headers, json={
+            "subscribed_fields": subscribed_fields,
+        }, timeout=10)
         
         if response.status_code == 200:
             data = response.json()

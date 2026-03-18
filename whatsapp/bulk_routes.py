@@ -2,14 +2,15 @@
 import logging
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
-from sqlalchemy import func, distinct
+from sqlalchemy import func, distinct, case
 
 from models import db
-from .models import WhatsAppAccount, WhatsAppMessage
+from .models import WhatsAppAccount, WhatsAppMessage, WhatsAppConversation
 from .drip_models import WhatsAppDripCampaign, WhatsAppDripStep, WhatsAppDripEnrollment
 from .flow_access import require_account_access
 from .drip_engine import process_single_enrollment, trigger_campaign_now
 from .scheduler import add_campaign_job
+from .utils import normalize_phone_robust
 from rate_limit.decorator import rate_limit
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,21 @@ def list_campaigns():
         
     campaigns = query.order_by(WhatsAppDripCampaign.created_at.desc()).all()
     
+    # Batch-fetch message status counts for all campaign IDs
+    campaign_ids = [c.id for c in campaigns]
+    msg_stats_query = db.session.query(
+        WhatsAppMessage.campaign_id,
+        WhatsAppMessage.status,
+        func.count(distinct(WhatsAppMessage.conversation_id))
+    ).filter(
+        WhatsAppMessage.campaign_id.in_(campaign_ids)
+    ).group_by(WhatsAppMessage.campaign_id, WhatsAppMessage.status).all()
+    
+    # Build {campaign_id: {status: count}} lookup
+    campaign_msg_counts = {}
+    for cid, status_val, cnt in msg_stats_query:
+        campaign_msg_counts.setdefault(cid, {})[status_val] = cnt
+    
     result = []
     for c in campaigns:
         # Calculate stats on the fly or use cached columns
@@ -56,13 +72,20 @@ def list_campaigns():
         # Map trigger_value to scheduled_at for manual campaigns
         c_dict["scheduled_at"] = c.trigger_value if c.trigger_type == "manual" else None
         
+        # Compute real delivery/read rates from message statuses
+        counts = campaign_msg_counts.get(c.id, {})
+        delivered = counts.get("delivered", 0) + counts.get("read", 0)
+        read = counts.get("read", 0)
+        failed = counts.get("failed", 0)
+        
         c_dict.update({
              "total_recipients": total,
              "sent_count": sent,
              "pending_count": total - sent,
              "progress_percent": int((sent / total * 100)) if total > 0 else 0,
-             "delivery_rate": 0, # TODO: Real delivery tracking
-             "read_rate": 0
+             "delivery_rate": int((delivered / sent * 100)) if sent > 0 else 0,
+             "read_rate": int((read / sent * 100)) if sent > 0 else 0,
+             "failed_count": failed,
         })
         result.append(c_dict)
         
@@ -133,37 +156,123 @@ def get_campaign_stats(campaign_id: int):
     """Get live stats for a campaign."""
     campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
     
-    # Simple stats for now based on enrollment table
+    # Enrollment-level stats
     total = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id).count()
     completed = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="completed").count()
-    failed = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="failed").count()
+    enrollment_failed = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="failed").count()
     active = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="active").count()
+    blocked = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="blocked_missing_data").count()
     
-    # Real stats from messages table (Unique Users)
-    # Delivered includes 'delivered' and 'read' status
-    delivered = db.session.query(func.count(distinct(WhatsAppMessage.conversation_id)))\
-        .filter(WhatsAppMessage.campaign_id == campaign_id, WhatsAppMessage.status.in_(["delivered", "read"]))\
-        .scalar() or 0
+    # Real stats from messages table — counts actual delivery outcomes from webhooks
+    msg_stats = db.session.query(
+        WhatsAppMessage.status,
+        func.count(distinct(WhatsAppMessage.conversation_id))
+    ).filter(
+        WhatsAppMessage.campaign_id == campaign_id
+    ).group_by(WhatsAppMessage.status).all()
     
-    read = db.session.query(func.count(distinct(WhatsAppMessage.conversation_id)))\
-        .filter(WhatsAppMessage.campaign_id == campaign_id, WhatsAppMessage.status == "read")\
-        .scalar() or 0
+    msg_counts = {s: c for s, c in msg_stats}
+    
+    # Message-level delivery failures (from Meta webhook, e.g. error 130472, 131049)
+    msg_failed = msg_counts.get("failed", 0)
+    # Delivered = delivered + read (read implies delivered)
+    delivered = msg_counts.get("delivered", 0) + msg_counts.get("read", 0)
+    read = msg_counts.get("read", 0)
+    
+    # Total failed = enrollment-level failures + message-level delivery failures
+    total_failed = enrollment_failed + blocked + msg_failed
+    # Sent = completed enrollments (API accepted the message)
+    sent = completed
 
     stats = {
         "total_recipients": total,
-        "sent": completed,
-        "failed": failed,
+        "sent": sent,
+        "failed": total_failed,
         "pending": active, 
         "queued": 0,
         "delivered": delivered,
         "read": read,
         "progress_percent": int((completed / total * 100)) if total > 0 else 0,
-        "delivery_rate": int((delivered / completed * 100)) if completed > 0 else 0,
-        "read_rate": int((read / completed * 100)) if completed > 0 else 0,
-        "failure_rate": int((failed / total * 100)) if total > 0 else 0
+        "delivery_rate": int((delivered / sent * 100)) if sent > 0 else 0,
+        "read_rate": int((read / sent * 100)) if sent > 0 else 0,
+        "failure_rate": int((total_failed / total * 100)) if total > 0 else 0
     }
     
     return jsonify({"success": True, "stats": stats})
+
+
+@bulk_bp.route("/campaigns/<int:campaign_id>/failed", methods=["GET"])
+def get_campaign_failed_messages(campaign_id: int):
+    """Get details of failed message deliveries for a campaign."""
+    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
+    
+    # Get messages that failed delivery (webhook reported failure)
+    failed_messages = db.session.query(
+        WhatsAppMessage.id,
+        WhatsAppMessage.error_code,
+        WhatsAppMessage.error_message,
+        WhatsAppMessage.created_at,
+        WhatsAppConversation.user_phone
+    ).join(
+        WhatsAppConversation, WhatsAppMessage.conversation_id == WhatsAppConversation.id
+    ).filter(
+        WhatsAppMessage.campaign_id == campaign_id,
+        WhatsAppMessage.status == "failed"
+    ).all()
+    
+    # Get enrollments that failed at enrollment level
+    failed_enrollments = WhatsAppDripEnrollment.query.filter(
+        WhatsAppDripEnrollment.campaign_id == campaign_id,
+        WhatsAppDripEnrollment.status.in_(["failed", "blocked_missing_data"])
+    ).all()
+    
+    failures = []
+    for msg in failed_messages:
+        failures.append({
+            "phone": msg.user_phone,
+            "error_code": msg.error_code,
+            "error_message": msg.error_message,
+            "type": "delivery_failed",
+            "timestamp": msg.created_at.isoformat() + "Z" if msg.created_at else None
+        })
+    for enr in failed_enrollments:
+        failures.append({
+            "phone": enr.phone_number,
+            "error_code": None,
+            "error_message": enr.status_reason or enr.status,
+            "type": "enrollment_failed",
+            "timestamp": None
+        })
+    
+    return jsonify({"success": True, "failures": failures})
+
+@bulk_bp.route("/campaigns/<int:campaign_id>/resubscribe-webhooks", methods=["POST"])
+def resubscribe_campaign_webhooks(campaign_id: int):
+    """Re-subscribe WABA webhooks for a campaign's account. 
+    
+    Use this to fix webhook delivery issues when status updates stop arriving.
+    """
+    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
+    account = WhatsAppAccount.query.get(campaign.account_id)
+    
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    
+    access_token = account.get_access_token()
+    if not access_token:
+        return jsonify({"success": False, "error": "No access token for account"}), 400
+    
+    from .health_check import subscribe_waba_to_webhooks
+    success, message, details = subscribe_waba_to_webhooks(account.waba_id, access_token)
+    
+    return jsonify({
+        "success": success,
+        "message": message,
+        "details": details,
+        "waba_id": account.waba_id,
+        "account_phone": account.display_phone_number,
+    }), 200 if success else 400
+
 
 @bulk_bp.route("/crm-audience", methods=["GET"])
 def get_crm_audience():
@@ -207,12 +316,12 @@ def get_crm_audience():
     whatsapp_ready = 0
     
     for r in records:
-        # Normalize phone
+        # Normalize phone using robust normalizer
         raw_phone = r.phone or ""
-        norm_phone = "".join(filter(str.isdigit, str(raw_phone)))
+        norm_phone = normalize_phone_robust(raw_phone)
         
-        # Basic validation (at least 10 digits)
-        is_valid = len(norm_phone) >= 10
+        # Valid if normalizer returned a result
+        is_valid = norm_phone is not None
         
         if raw_phone:
             with_phone += 1
@@ -223,7 +332,7 @@ def get_crm_audience():
             "id": r.id,
             "name": r.name,
             "phone": raw_phone,
-            "phone_normalized": norm_phone if is_valid else None,
+            "phone_normalized": norm_phone,
             "email": r.email,
             "company": r.company,
             "status": r.status,
@@ -267,9 +376,9 @@ def add_recipients(campaign_id: int):
             invalid_count += 1
             continue
             
-        # Basic validation: strip non-digits and check length
-        clean_phone = "".join(filter(str.isdigit, str(phone)))
-        if len(clean_phone) < 10:
+        # Robust normalization: handles multi-number, country codes, etc.
+        clean_phone = normalize_phone_robust(phone)
+        if not clean_phone:
             invalid_count += 1
             continue
             
@@ -287,7 +396,7 @@ def add_recipients(campaign_id: int):
         else:
             enrollment = WhatsAppDripEnrollment(
                 campaign_id=campaign_id,
-                phone_number=phone,
+                phone_number=clean_phone,
                 current_step_order=0,
                 status="active",
                 variables=r.get("params", {}),

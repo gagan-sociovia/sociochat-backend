@@ -47,6 +47,7 @@ from .utils import (
     extract_media_info,
     is_duplicate_message,
 )
+from SocioviaCrm.capi_service import send_capi_event
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +163,7 @@ class WebhookProcessor:
             raw_json: Original raw JSON for logging
         """
         # WABA ID is in entry.id - used for multi-tenant routing
-        waba_id = entry.get("id")
+        waba_id = entry.get("id") or ""
         changes = entry.get("changes", [])
         
         for change in changes:
@@ -191,24 +192,32 @@ class WebhookProcessor:
                 continue
             
             # ============================================================
-            # Handle History Sync (Coexistence)
+            # Handle Message Echoes (Coexistence: messages sent from mobile)
             # ============================================================
-            if field == "history_sync":
-                self._process_history_sync(waba_id, value, raw_json)
+            if field in ("message_echoes", "smb_message_echoes"):
+                phone_number_id = value.get("metadata", {}).get("phone_number_id")
+                echo_messages = value.get("messages", value.get("message_echoes", []))
+                for echo_msg in echo_messages:
+                    self._process_echo(echo_msg, phone_number_id)
+                self._log_webhook(raw_json, "echo", phone_number_id)
                 continue
             
             # ============================================================
-            # Handle SMB Message Echoes (Coexistence - mobile app messages)
+            # Handle History Sync (Coexistence: 180-day history after QR)
             # ============================================================
-            if field == "smb_message_echoes":
+            if field in ("history_sync", "history"):
                 phone_number_id = value.get("metadata", {}).get("phone_number_id")
-                echo_messages = value.get("messages", [])
-                echo_contacts = value.get("contacts", [])
-                
-                for message in echo_messages:
-                    contact = self._find_contact(message.get("to"), echo_contacts)
-                    self._process_echo_message(message, contact, phone_number_id)
-                    self._log_webhook(raw_json, "echo", phone_number_id)
+                self._process_history_sync(value, phone_number_id)
+                self._log_webhook(raw_json, "history_sync", phone_number_id)
+                continue
+            
+            # ============================================================
+            # Handle Contacts Sync (Coexistence: contacts from WA Business app)
+            # ============================================================
+            if field == "smb_app_state_sync":
+                phone_number_id = value.get("metadata", {}).get("phone_number_id")
+                logger.info(f"Contacts sync webhook received for {phone_number_id}")
+                self._log_webhook(raw_json, "contacts_sync", phone_number_id)
                 continue
             
             # ============================================================
@@ -220,6 +229,25 @@ class WebhookProcessor:
                 continue
             
             phone_number_id = value.get("metadata", {}).get("phone_number_id")
+            
+            # ============================================================
+            # Coexistence: History sync can arrive under field="messages"
+            # with "history" key in value instead of "messages"/"statuses"
+            # ============================================================
+            if "history" in value:
+                logger.info(f"History sync data detected under messages field for {phone_number_id}")
+                self._process_history_sync(value, phone_number_id)
+                self._log_webhook(raw_json, "history_sync", phone_number_id)
+                continue
+            
+            # ============================================================
+            # Coexistence: Contacts sync can arrive under field="messages"
+            # with "contacts" key but no "messages" key
+            # ============================================================
+            if "smb_app_state_sync" in value or ("contacts" in value and "messages" not in value and "statuses" not in value):
+                logger.info(f"Contacts sync data detected under messages field for {phone_number_id}")
+                self._log_webhook(raw_json, "contacts_sync", phone_number_id)
+                continue
             
             # Process statuses (delivery receipts)
             statuses = value.get("statuses", [])
@@ -322,22 +350,14 @@ class WebhookProcessor:
         conversation.unread_count = (conversation.unread_count or 0) + 1
         
         # Process CTWA attribution if this is from an ad
-        self._process_attribution(message, conversation)
+        self._process_attribution(message, conversation, account=account)
         
-        # Update CRM contact record
         try:
-            from .coexistence_service import ContactManager
-            contact_name = contact.get("profile", {}).get("name") if contact else None
-            ContactManager.upsert_contact(
-                account_id=account.id,
-                phone=from_phone,
-                name=contact_name,
-                wa_id=from_phone,
-            )
-        except Exception as e:
-            logger.debug(f"Contact upsert non-critical error: {e}")
-        
-        self.db_session.commit()
+            self.db_session.commit()
+        except Exception as commit_err:
+            logger.exception(f"Failed to commit incoming message: {commit_err}")
+            self.db_session.rollback()
+            return
         print(f"✅ Stored message: id={msg_record.id}, type={msg_type}, content={content}")
         logger.info(f"Stored incoming message: {wamid} from {from_phone}")
 
@@ -368,6 +388,8 @@ class WebhookProcessor:
                     is_button_reply=False,
                     button_payload=None
                 )
+            # Check for lead keywords in text messages
+            self._check_for_lead_keywords(account, conversation, text_content)
         elif msg_type == "interactive":
             # Handle button replies from interactive messages
             interactive = message.get("interactive", {})
@@ -395,22 +417,76 @@ class WebhookProcessor:
                     is_button_reply=True,
                     button_payload=button_payload
                 )
-        elif msg_type == "button":
-            # Handle quick_reply button clicks from TEMPLATE messages
-            # Meta sends these as type="button" (NOT type="interactive")
-            button_data = message.get("button", {})
-            button_text = button_data.get("text", "")
-            button_payload = button_data.get("payload", "")
-            if button_payload:
-                self._process_automation(
-                    account=account,
-                    conversation=conversation,
-                    message_text=button_text,
-                    message_id=msg_record.id,
-                    from_phone=from_phone,
-                    is_button_reply=True,
-                    button_payload=button_payload,
-                )
+        
+        # Check for Lead Keywords / Ref Tags in text messages
+        if msg_type == "text":
+            text_content = extract_message_text(message)
+            self._check_for_lead_keywords(account, conversation, text_content)
+    
+    def _check_for_lead_keywords(self, account, conversation, text):
+        """
+        Check message text for lead identifiers (Ref tags, campaign IDs).
+        Suggested by user: "Interested_in_Lead", "Campaign_ID_987".
+        """
+        if not text:
+            return
+            
+        text_lower = text.lower()
+        lead_triggers = ["interested_in_lead", "campaign_id_", "ref:", "ad_id:"]
+        
+        matched = False
+        for trigger in lead_triggers:
+            if trigger in text_lower:
+                matched = True
+                break
+        
+        if matched:
+            logger.info(f"Lead trigger matched in text: '{text}' for conversation {conversation.id}")
+            # Try to extract a specific ID if present (e.g. Campaign_ID_987 -> 987)
+            ad_id = None
+            import re
+            match = re.search(r"(?:campaign_id_|ref:|ad_id:)\s*(\w+)", text, re.I)
+            if match:
+                ad_id = match.group(1)
+            
+            self._trigger_capi_lead_event(account, conversation, ad_id=ad_id)
+
+    def _trigger_capi_lead_event(self, account, conversation, ad_id=None):
+        """
+        Trigger a 'Lead' event to Meta Conversions API.
+        """
+        try:
+            # Avoid duplicate Lead events in short succession (e.g. within 1 hour)
+            # You might want to implement a more robust check based on ad_id
+            
+            user_data = {
+                "phone": conversation.user_phone,
+                "name": conversation.user_name,
+            }
+            
+            custom_data = {
+                "lead_type": "whatsapp_inquiry",
+                "source": "whatsapp_wehook"
+            }
+            if ad_id:
+                custom_data["ad_id"] = ad_id
+            elif conversation.ad_id:
+                custom_data["ad_id"] = conversation.ad_id
+                
+            if conversation.ctwa_clid:
+                user_data["ctwa_clid"] = conversation.ctwa_clid
+                
+            send_capi_event(
+                event_name="Lead",
+                user_data_dict=user_data,
+                custom_data_dict=custom_data,
+                workspace_id=account.workspace_id,
+                action_source="business_messaging"
+            )
+            logger.info(f"Triggered CAPI Lead event for workspace {account.workspace_id}, phone {conversation.user_phone}")
+            
+        except Exception as e:
+            logger.error(f"Failed to trigger CAPI Lead event: {e}")
     
     def _process_status(self, status: Dict[str, Any], phone_number_id: str):
         """
@@ -457,7 +533,11 @@ class WebhookProcessor:
         
         if not message:
             logger.debug(f"Status update for unknown message: {wamid}")
-            self.db_session.commit()  # Still commit the status event
+            try:
+                self.db_session.commit()  # Still commit the status event
+            except Exception as e:
+                logger.warning(f"Failed to commit status event: {e}")
+                self.db_session.rollback()
             return
         
         # Update status
@@ -476,8 +556,20 @@ class WebhookProcessor:
         elif status_value == "failed":
             message.error_code = error_code
             message.error_message = error_message
+            # Log campaign-level failure for visibility
+            if message.campaign_id:
+                logger.warning(
+                    f"Campaign {message.campaign_id} message delivery failed: "
+                    f"recipient={recipient}, wamid={wamid}, "
+                    f"error_code={error_code}, error={error_message}"
+                )
         
-        self.db_session.commit()
+        try:
+            self.db_session.commit()
+        except Exception as e:
+            logger.warning(f"Failed to commit status update: {e}")
+            self.db_session.rollback()
+            return
         logger.debug(f"Updated message status: {wamid} {old_status} -> {status_value}")
 
         # Broadcast real-time status update
@@ -518,112 +610,6 @@ class WebhookProcessor:
             f"WhatsApp error: code={error_code}, title={error_title}, "
             f"message={error_message}, details={error_details}"
         )
-        
-        # Classify error for monitoring
-        try:
-            from .coexistence_service import classify_meta_error
-            classification = classify_meta_error(str(error_code))
-            if classification.get("severity") == "critical":
-                logger.critical(f"CRITICAL Meta error {error_code}: {classification['description']}")
-        except Exception:
-            pass
-    
-    def _process_echo_message(
-        self,
-        message: Dict[str, Any],
-        contact: Optional[Dict[str, Any]],
-        phone_number_id: str,
-    ):
-        """
-        Process an echo message from the WhatsApp Business mobile app (coexistence).
-        
-        Echo messages are sent when the business responds via their mobile phone.
-        They are stored with direction='echo' to distinguish from Cloud API outgoing.
-        
-        Args:
-            message: Message object from smb_message_echoes webhook
-            contact: Contact info if available
-            phone_number_id: Our business phone number ID
-        """
-        try:
-            from .coexistence_service import EchoHandler
-            msg_record = EchoHandler.process_echo(phone_number_id, message, contact)
-            if msg_record:
-                print(f"📱 Echo message stored: {msg_record.wamid} (from mobile app)")
-                
-                # Broadcast real-time echo event
-                try:
-                    account = WhatsAppAccount.query.filter_by(
-                        phone_number_id=phone_number_id
-                    ).first()
-                    if account and msg_record.conversation:
-                        notification_manager.broadcast("whatsapp_echo_received", {
-                            "message": msg_record.to_dict(),
-                            "conversation_id": msg_record.conversation_id,
-                            "account_id": account.id,
-                            "workspace_id": account.workspace_id,
-                            "source": "mobile_app",
-                        })
-                except Exception as e:
-                    logger.error(f"Failed to broadcast echo event: {e}")
-        except Exception as e:
-            logger.exception(f"Echo message processing error: {e}")
-    
-    def _process_history_sync(self, waba_id: str, value: Dict[str, Any], raw_json: str):
-        """
-        Process history sync webhook data (coexistence).
-        
-        After QR handshake, Meta sends up to 180 days of chat history
-        in batches via this webhook field.
-        
-        Args:
-            waba_id: WABA ID from the webhook entry
-            value: The change value containing history sync data
-            raw_json: Raw JSON for logging
-        """
-        try:
-            phone_number_id = value.get("metadata", {}).get("phone_number_id")
-            
-            # Find the account
-            account = WhatsAppAccount.query.filter_by(
-                phone_number_id=phone_number_id,
-            ).first() if phone_number_id else WhatsAppAccount.query.filter_by(
-                waba_id=waba_id,
-            ).first()
-            
-            if not account:
-                logger.warning(f"History sync: No account found for WABA {waba_id}")
-                self._log_webhook(raw_json, "history_sync", phone_number_id, "No account found")
-                return
-            
-            # Update sync status
-            account.sync_status = "syncing"
-            
-            # Extract messages from the sync data
-            messages = value.get("messages", [])
-            batch_id = value.get("batch_id") or value.get("id")
-            
-            if messages:
-                from .coexistence_service import HistorySyncHandler
-                result = HistorySyncHandler.process_history_batch(
-                    account_id=account.id,
-                    messages=messages,
-                    batch_id=batch_id,
-                )
-                logger.info(f"History sync batch result: {result}")
-            
-            # Check if this is the final batch
-            is_final = value.get("is_final", False) or value.get("final", False)
-            if is_final:
-                from .coexistence_service import HistorySyncHandler
-                HistorySyncHandler.mark_sync_complete(account.id)
-            
-            self._log_webhook(raw_json, "history_sync", phone_number_id)
-            self.db_session.commit()
-            
-        except Exception as e:
-            logger.exception(f"History sync processing error: {e}")
-            self._log_webhook(raw_json, "history_sync", None, str(e))
     
     def _extract_content(self, message: Dict[str, Any], msg_type: str) -> Dict[str, Any]:
         """
@@ -636,7 +622,7 @@ class WebhookProcessor:
         Returns:
             Content dict
         """
-        content = {"type": msg_type}
+        content: Dict[str, Any] = {"type": msg_type}
         
         if msg_type == "text":
             content["text"] = message.get("text", {}).get("body", "")
@@ -760,6 +746,7 @@ class WebhookProcessor:
         self,
         message: Dict[str, Any],
         conversation: WhatsAppConversation,
+        account: Optional[WhatsAppAccount] = None,
     ):
         """
         Process CTWA attribution if this message came from an ad click.
@@ -795,6 +782,9 @@ class WebhookProcessor:
                 logger.info(
                     f"Attributed conversation {conversation.id} to ad {attribution.ad_id}"
                 )
+                
+                # Trigger CAPI Lead event for official ad click
+                self._trigger_capi_lead_event(account, conversation, ad_id=attribution.ad_id)
         except Exception as e:
             logger.exception(f"Failed to process attribution: {e}")
     
@@ -804,6 +794,92 @@ class WebhookProcessor:
             if contact.get("wa_id") == phone:
                 return contact
         return None
+    
+    def _trigger_capi_lead_event(
+        self,
+        account: WhatsAppAccount,
+        conversation: WhatsAppConversation,
+        ad_id: Optional[str] = None,
+        lead_type: str = "ctwa",
+        ctwa_clid: Optional[str] = None,
+    ):
+        """
+        Send a 'Lead' event to Meta CAPI for attribution.
+        """
+        try:
+            user_data = {
+                "ph": conversation.user_phone,
+            }
+            if conversation.user_name:
+                name_parts = conversation.user_name.split(" ", 1)
+                user_data["fn"] = name_parts[0]
+                if len(name_parts) > 1:
+                    user_data["ln"] = name_parts[1]
+            if ctwa_clid:
+                user_data["ctwa_clid"] = ctwa_clid
+
+            custom_data = {
+                "lead_type": lead_type,
+                "source": "whatsapp",
+            }
+            if ad_id:
+                custom_data["ad_id"] = ad_id
+
+            result = send_capi_event(
+                event_name="Lead",
+                user_data_dict=user_data,
+                custom_data_dict=custom_data,
+                workspace_id=account.workspace_id,
+                action_source="business_messaging",
+            )
+            logger.info(f"CAPI Lead event sent for conv {conversation.id}: {result}")
+        except Exception as e:
+            logger.exception(f"Failed to send CAPI Lead event: {e}")
+    
+    def _check_for_lead_keywords(
+        self,
+        account: WhatsAppAccount,
+        conversation: WhatsAppConversation,
+        text: str,
+    ):
+        """
+        Check incoming text for lead-identifying keywords/ref params.
+        If found, trigger a CAPI Lead event.
+        """
+        import re
+
+        if not text:
+            return
+
+        lead_patterns = [
+            r"Interested_in_Lead",
+            r"Campaign_ID_(\w+)",
+            r"Ref:\s*(\S+)",
+            r"Ad_ID:\s*(\S+)",
+        ]
+
+        ad_id = None
+        matched = False
+
+        for pattern in lead_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                matched = True
+                last_idx = match.lastindex
+                if last_idx is not None and last_idx >= 1:
+                    ad_id = match.group(1)
+                break
+
+        if matched:
+            # Tag conversation as keyword-sourced lead if not already attributed
+            if not conversation.entry_source:
+                conversation.entry_source = "keyword"
+                if ad_id:
+                    conversation.ad_id = ad_id
+            self._trigger_capi_lead_event(
+                account, conversation, ad_id=ad_id, lead_type="keyword"
+            )
+            logger.info(f"Keyword lead detected in conv {conversation.id}, ad_id={ad_id}")
     
     def _process_automation(
         self,
@@ -910,6 +986,10 @@ class WebhookProcessor:
             # CRITICAL: Never let automation errors break message processing
             logger.exception(f"Automation processing error (non-fatal): {e}")
             print(f"⚠️ Automation error (non-fatal): {e}")
+            try:
+                self.db_session.rollback()
+            except Exception:
+                pass
 
     # ============================================================
     # Template Webhook Handlers (Multi-tenant)
@@ -1240,6 +1320,273 @@ class WebhookProcessor:
         except Exception as e:
             logger.exception(f"Error processing template category update: {e}")
             self._log_webhook(raw_json, "template_category_update", None, str(e))
+    
+    # ============================================================
+    # Coexistence: Echo Message Handler
+    # ============================================================
+    
+    def _process_echo(self, echo_msg: Dict[str, Any], phone_number_id: str):
+        """
+        Process a message echo from coexistence mode.
+        
+        Echoes are messages sent from the WhatsApp mobile app by the business.
+        We store them as direction='echo' to show in the inbox alongside
+        agent-sent and customer messages.
+        
+        This also updates device_activity tracking (last_echo_at).
+        
+        Args:
+            echo_msg: Echo message object from webhook
+            phone_number_id: Our phone number ID
+        """
+        from .utils import normalize_phone, parse_whatsapp_timestamp, get_message_type
+        
+        wamid = echo_msg.get("id")
+        to_phone = echo_msg.get("to")
+        msg_type = get_message_type(echo_msg)
+        timestamp = echo_msg.get("timestamp")
+        
+        logger.info(f"📱 Echo message received: wamid={wamid}, to={to_phone}, type={msg_type}")
+        
+        if not wamid or not to_phone:
+            logger.warning("Echo message missing wamid or to")
+            return
+        
+        # Deduplicate by wamid
+        existing = WhatsAppMessage.query.filter_by(wamid=wamid).first()
+        if existing:
+            logger.debug(f"Duplicate echo skipped: {wamid}")
+            return
+        
+        # Get account
+        account = self._get_or_create_account(phone_number_id)
+        if not account:
+            return
+        
+        # Update device activity tracking
+        account.last_echo_at = datetime.now(timezone.utc)
+        
+        # Normalize to_phone
+        to_phone = normalize_phone(to_phone)
+        
+        # Get or create conversation with the recipient
+        conversation = self._get_or_create_conversation(account.id, to_phone)
+        
+        # Build content
+        content = self._extract_content(echo_msg, msg_type)
+        content["echo"] = True  # Mark as echo message
+        
+        # Parse timestamp
+        msg_timestamp = parse_whatsapp_timestamp(timestamp) or datetime.now(timezone.utc)
+        
+        # Store echo message with direction='echo'
+        msg_record = WhatsAppMessage(
+            conversation_id=conversation.id,
+            direction="echo",  # Key difference: messages from mobile app
+            type=msg_type,
+            content=content,
+            wamid=wamid,
+            status="sent",
+            created_at=msg_timestamp,
+            sent_at=msg_timestamp,
+        )
+        self.db_session.add(msg_record)
+        
+        # Update conversation timestamps
+        conversation.last_message_at = msg_timestamp
+        conversation.last_outbound_at = msg_timestamp
+        
+        self.db_session.commit()
+        logger.info(f"✅ Stored echo message: id={msg_record.id}, type={msg_type}")
+        
+        # Broadcast real-time event
+        try:
+            from notifications import notification_manager
+            # Standardize on 'whatsapp_message_received' so frontend only needs one handler
+            # for both incoming and echoes (sent from mobile)
+            notification_manager.broadcast("whatsapp_message_received", {
+                "message": msg_record.to_dict(),
+                "conversation_id": conversation.id,
+                "account_id": account.id,
+                "workspace_id": account.workspace_id,
+                "source": "mobile_app",
+                "direction": "echo"
+            })
+        except Exception as e:
+            logger.error(f"Failed to broadcast echo event: {e}")
+    
+    # ============================================================
+    # Coexistence: History Sync Handler
+    # ============================================================
+    
+    def _process_history_sync(self, value: Dict[str, Any], phone_number_id: str):
+        """
+        Process history sync webhook from coexistence mode.
+        
+        Meta sends history in phases (0-2) with threads containing messages.
+        Payload structure:
+        {
+          "history": [{
+            "metadata": {"phase": 0, "chunk_order": 1, "progress": 55},
+            "threads": [{
+              "id": "<user_phone>",
+              "messages": [{ ... }]
+            }]
+          }]
+        }
+        
+        Or if history sharing was declined:
+        { "history": [{ "errors": [{ "code": 2593109, ... }] }] }
+        """
+        from .utils import normalize_phone, parse_whatsapp_timestamp, get_message_type
+        
+        logger.info(f"📚 History sync received for {phone_number_id}")
+        
+        account = self._get_or_create_account(phone_number_id)
+        if not account:
+            return
+        
+        # Update sync status
+        if account.sync_status != "synced":
+            account.sync_status = "syncing"
+        
+        # Meta sends data in "history" array, each with "threads"
+        # Also support legacy "conversations" format
+        history_entries = value.get("history", [])
+        conversations_data = value.get("conversations", [])
+        
+        synced_count: int = 0
+        skipped_count: int = 0
+        progress: int = 0
+        
+        for entry in history_entries:
+            # Check for errors (e.g., user declined history sharing)
+            if "errors" in entry:
+                for err in entry["errors"]:
+                    logger.warning(f"History sync error: code={err.get('code')} - {err.get('message')}")
+                    if err.get("code") == 2593109:
+                        logger.info("Business declined to share chat history")
+                        account.sync_status = "synced"
+                        account.history_sync_completed = True
+                        self.db_session.commit()
+                        return
+                continue
+            
+            metadata = entry.get("metadata", {})
+            phase = metadata.get("phase", 0)
+            chunk_order = metadata.get("chunk_order", 0)
+            progress = metadata.get("progress", 0)
+            logger.info(f"📚 History phase={phase}, chunk={chunk_order}, progress={progress}%")
+            
+            threads = entry.get("threads", [])
+            for thread in threads:
+                contact_phone = thread.get("id")
+                if not contact_phone:
+                    continue
+                
+                contact_phone = normalize_phone(contact_phone)
+                
+                conversation = self._get_or_create_conversation(
+                    account.id, contact_phone, None
+                )
+                
+                messages = thread.get("messages", [])
+                for msg in messages:
+                    wamid = msg.get("id")
+                    if not wamid:
+                        continue
+                    
+                    existing = WhatsAppMessage.query.filter_by(wamid=wamid).first()
+                    if existing:
+                        skipped_count += 1
+                        continue
+                    
+                    msg_type = get_message_type(msg)
+                    timestamp = msg.get("timestamp")
+                    msg_timestamp = parse_whatsapp_timestamp(timestamp) or datetime.now(timezone.utc)
+                    
+                    from_phone = msg.get("from")
+                    to_phone = msg.get("to")
+                    is_from_business = (from_phone and from_phone != contact_phone)
+                    direction = "echo" if is_from_business else "incoming"
+                    
+                    content = self._extract_content(msg, msg_type)
+                    content["history_sync"] = True
+                    content["phase"] = phase
+                    
+                    msg_record = WhatsAppMessage(
+                        conversation_id=conversation.id,
+                        direction=direction,
+                        type=msg_type,
+                        content=content,
+                        wamid=wamid,
+                        status=msg.get("status", "sent" if direction == "echo" else "received"),
+                        created_at=msg_timestamp,
+                    )
+                    self.db_session.add(msg_record)
+                    synced_count += 1
+                    
+                    if not conversation.last_message_at or msg_timestamp > conversation.last_message_at:
+                        conversation.last_message_at = msg_timestamp
+                
+                try:
+                    self.db_session.commit()
+                except Exception as e:
+                    self.db_session.rollback()
+                    logger.error(f"Failed to commit history sync for {contact_phone}: {e}")
+        
+        # Also handle legacy "conversations" format
+        for conv_data in conversations_data:
+            contact_phone = conv_data.get("id") or conv_data.get("phone")
+            if not contact_phone:
+                continue
+            contact_phone = normalize_phone(contact_phone)
+            contact_name = conv_data.get("name")
+            conversation = self._get_or_create_conversation(account.id, contact_phone, contact_name)
+            messages = conv_data.get("messages", [])
+            for msg in messages:
+                wamid = msg.get("id")
+                if not wamid:
+                    continue
+                existing = WhatsAppMessage.query.filter_by(wamid=wamid).first()
+                if existing:
+                    skipped_count += 1
+                    continue
+                msg_type = get_message_type(msg)
+                timestamp = msg.get("timestamp")
+                msg_timestamp = parse_whatsapp_timestamp(timestamp) or datetime.now(timezone.utc)
+                from_phone = msg.get("from")
+                is_from_business = from_phone == phone_number_id if from_phone else False
+                direction = "echo" if is_from_business else "incoming"
+                content = self._extract_content(msg, msg_type)
+                content["history_sync"] = True
+                msg_record = WhatsAppMessage(
+                    conversation_id=conversation.id, direction=direction, type=msg_type,
+                    content=content, wamid=wamid,
+                    status="sent" if direction == "echo" else "received",
+                    created_at=msg_timestamp,
+                )
+                self.db_session.add(msg_record)
+                synced_count += 1
+                if not conversation.last_message_at or msg_timestamp > conversation.last_message_at:
+                    conversation.last_message_at = msg_timestamp
+            try:
+                self.db_session.commit()
+            except Exception as e:
+                self.db_session.rollback()
+                logger.error(f"Failed to commit history sync for {contact_phone}: {e}")
+        
+        # Final status update
+        try:
+            if progress >= 100:
+                account.sync_status = "synced"
+                account.history_sync_completed = True
+            
+            self.db_session.commit()
+            logger.info(f"📚 History sync: {synced_count} new, {skipped_count} duplicates skipped, progress={progress}%")
+        except Exception as e:
+            self.db_session.rollback()
+            logger.error(f"History sync final commit error: {e}")
     
     def _log_webhook(
         self,

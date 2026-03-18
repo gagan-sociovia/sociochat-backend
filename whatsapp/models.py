@@ -37,7 +37,7 @@ class MessageDirection(enum.Enum):
     """Message direction."""
     INCOMING = "incoming"
     OUTGOING = "outgoing"
-    ECHO = "echo"  # Message sent from mobile WhatsApp Business App (coexistence)
+    ECHO = "echo"  # Messages sent from common mobile app
 
 
 class MessageType(enum.Enum):
@@ -333,19 +333,16 @@ class WhatsAppAccount(db.Model):
     notification_phone_number = db.Column(db.String(32), nullable=True)  # Phone number to receive app notifications (e.g., waitlist alerts)
     
     # ============================================================
-    # Coexistence Mode Fields
+    # Coexistence Fields
     # ============================================================
-    is_coexistence = db.Column(db.Boolean, default=False, nullable=False)  # True if using coexistence (existing WABA)
+    is_coexistence = db.Column(db.Boolean, default=False, nullable=False)  # True if connected via coexistence (mobile app stays active)
+    mps_limit = db.Column(db.Integer, default=80, nullable=False)  # Messages per second limit (5 for coexistence, 80-1000 for standard)
     meta_business_id = db.Column(db.String(64), nullable=True)  # Meta Business Manager ID
-    mps_limit = db.Column(db.Integer, default=80, nullable=False)  # Messages per second limit (coexistence=5, standard=80-1000)
     sync_status = db.Column(db.String(32), default="idle", nullable=False)  # idle, syncing, synced, error
-    last_echo_at = db.Column(db.DateTime, nullable=True)  # Last time a business echo was received (mobile app activity)
-    last_mobile_activity_at = db.Column(db.DateTime, nullable=True)  # Last confirmed mobile app usage
-    history_sync_completed = db.Column(db.Boolean, default=False, nullable=False)  # True when 180-day history sync is done
-    history_sync_progress = db.Column(db.Integer, default=0, nullable=False)  # Percentage of history sync completed (0-100)
-    coexistence_paired_at = db.Column(db.DateTime, nullable=True)  # When coexistence QR handshake completed
-    device_inactive_alert_sent = db.Column(db.Boolean, default=False, nullable=False)  # True if >10 days inactive alert was sent
-
+    last_echo_at = db.Column(db.DateTime, nullable=True)  # Last time a mobile echo was received (device activity)
+    coexistence_paired_at = db.Column(db.DateTime, nullable=True)  # When QR handshake completed
+    history_sync_completed = db.Column(db.Boolean, default=False, nullable=False)  # Whether 180-day history sync is done
+    
     # Metadata
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
@@ -379,19 +376,16 @@ class WhatsAppAccount(db.Model):
             "token_expires_at": self.token_expires_at.isoformat() if self.token_expires_at else None,
             "connected_by_user_id": self.connected_by_user_id,
             "last_synced_at": self.last_synced_at.isoformat() if self.last_synced_at else None,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             # Coexistence fields
             "is_coexistence": self.is_coexistence,
-            "meta_business_id": self.meta_business_id,
             "mps_limit": self.mps_limit,
+            "meta_business_id": self.meta_business_id,
             "sync_status": self.sync_status,
             "last_echo_at": self.last_echo_at.isoformat() if self.last_echo_at else None,
-            "last_mobile_activity_at": self.last_mobile_activity_at.isoformat() if self.last_mobile_activity_at else None,
-            "history_sync_completed": self.history_sync_completed,
-            "history_sync_progress": self.history_sync_progress,
             "coexistence_paired_at": self.coexistence_paired_at.isoformat() if self.coexistence_paired_at else None,
-            "device_inactive_alert_sent": self.device_inactive_alert_sent,
+            "history_sync_completed": self.history_sync_completed,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
         
         # Only include token for internal backend use, never expose to frontend
@@ -478,6 +472,15 @@ class WhatsAppConversation(db.Model):
     closed_by_agent = db.Column(db.Boolean, default=False, nullable=False)
     closed_at = db.Column(db.DateTime, nullable=True)  # When agent closed the chat
     
+    # Attribution data (CTWA / Keywords)
+    entry_source = db.Column(db.String(32), nullable=True)  # ctwa, keyword, organic, flow
+    ctwa_clid = db.Column(db.String(255), nullable=True, index=True)
+    ad_id = db.Column(db.String(64), nullable=True, index=True)
+    campaign_id = db.Column(db.String(64), nullable=True, index=True)
+    adset_id = db.Column(db.String(64), nullable=True, index=True)
+    attribution_data = db.Column(JSON, nullable=True)  # Full raw attribution dict
+    attributed_at = db.Column(db.DateTime, nullable=True)
+    
     # Timestamps
     last_message_at = db.Column(db.DateTime, nullable=True)  # When last message was sent/received
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -547,6 +550,12 @@ class WhatsAppConversation(db.Model):
             "last_outbound_at": self.last_outbound_at.isoformat() if self.last_outbound_at else None,
             "session_expires_at": self.session_expires_at.isoformat() if self.session_expires_at else None,
             "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
+            "entry_source": self.entry_source,
+            "ctwa_clid": self.ctwa_clid,
+            "ad_id": self.ad_id,
+            "campaign_id": self.campaign_id,
+            "adset_id": self.adset_id,
+            "attributed_at": self.attributed_at.isoformat() if self.attributed_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -882,142 +891,31 @@ class WhatsAppFlow(db.Model):
         return new_flow
 
 
-# ============================================================
-# TABLE: WhatsApp Rate Limit Tracking (Token Bucket)
-# ============================================================
-
-class WhatsAppRateLimit(db.Model):
+class WhatsAppFavoriteSticker(db.Model):
     """
-    Token bucket rate limiter for WhatsApp message sending.
-    
-    Coexistence accounts: 5 MPS
-    Standard Cloud API accounts: 80-1000 MPS
-    
-    Uses a database-backed token bucket for persistence across restarts.
+    User/Workspace favorite stickers for quick reuse.
     """
-    __tablename__ = "whatsapp_rate_limits"
-    __table_args__ = ({"extend_existing": True},)
-
-    phone_number_id = db.Column(db.String(64), primary_key=True)
-    tokens = db.Column(db.Float, default=5.0, nullable=False)  # Available tokens
-    max_tokens = db.Column(db.Float, default=5.0, nullable=False)  # Bucket capacity (MPS)
-    last_refill = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    messages_sent_today = db.Column(db.Integer, default=0, nullable=False)  # Daily counter
-    last_reset_date = db.Column(db.Date, nullable=True)  # Date of last daily reset
-
-    def __repr__(self):
-        return f"<WhatsAppRateLimit {self.phone_number_id} tokens={self.tokens}/{self.max_tokens}>"
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "phone_number_id": self.phone_number_id,
-            "tokens": self.tokens,
-            "max_tokens": self.max_tokens,
-            "last_refill": self.last_refill.isoformat() if self.last_refill else None,
-            "messages_sent_today": self.messages_sent_today,
-        }
-
-
-# ============================================================
-# TABLE: WhatsApp History Sync Log
-# ============================================================
-
-class WhatsAppHistorySyncLog(db.Model):
-    """
-    Tracks history sync progress for coexistence accounts.
-    
-    After QR handshake, Meta sends up to 180 days of chat history.
-    This table tracks progress to handle chunk-based processing
-    and deduplication.
-    """
-    __tablename__ = "whatsapp_history_sync_logs"
+    __tablename__ = "whatsapp_favorite_stickers"
     __table_args__ = (
-        Index("ix_history_sync_account", "account_id"),
-        Index("ix_history_sync_status", "status"),
+        Index("ix_wa_fav_stickers_workspace", "workspace_id"),
         {"extend_existing": True},
     )
 
     id = db.Column(db.Integer, primary_key=True)
-    account_id = db.Column(db.Integer, db.ForeignKey("whatsapp_accounts.id", ondelete="CASCADE"), nullable=False)
-    batch_id = db.Column(db.String(128), nullable=True, index=True)  # Batch identifier from webhook
-    status = db.Column(db.String(32), default="pending", nullable=False)  # pending, processing, completed, error
-    messages_received = db.Column(db.Integer, default=0, nullable=False)
-    messages_stored = db.Column(db.Integer, default=0, nullable=False)
-    messages_duplicated = db.Column(db.Integer, default=0, nullable=False)
-    error_message = db.Column(db.Text, nullable=True)
-    started_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    completed_at = db.Column(db.DateTime, nullable=True)
-
-    # Relationship
-    account = db.relationship("WhatsAppAccount", backref=db.backref("history_sync_logs", lazy="dynamic"))
-
-    def __repr__(self):
-        return f"<WhatsAppHistorySyncLog {self.id} account={self.account_id} status={self.status}>"
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "account_id": self.account_id,
-            "batch_id": self.batch_id,
-            "status": self.status,
-            "messages_received": self.messages_received,
-            "messages_stored": self.messages_stored,
-            "messages_duplicated": self.messages_duplicated,
-            "error_message": self.error_message,
-            "started_at": self.started_at.isoformat() if self.started_at else None,
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
-        }
-
-
-# ============================================================
-# TABLE: WhatsApp Contacts (CRM-style contact tracking)
-# ============================================================
-
-class WhatsAppContact(db.Model):
-    """
-    CRM-style contact tracking for WhatsApp users.
+    workspace_id = db.Column(db.Integer, nullable=False, index=True)
+    media_id = db.Column(db.String(128), nullable=False)  # Meta Media ID
+    mime_type = db.Column(db.String(64), nullable=True)
+    sha256 = db.Column(db.String(128), nullable=True)
     
-    Aggregates contact info across conversations including labels,
-    last activity, and contact metadata from WhatsApp profiles.
-    """
-    __tablename__ = "whatsapp_contacts"
-    __table_args__ = (
-        UniqueConstraint("account_id", "wa_id", name="uq_account_contact"),
-        Index("ix_whatsapp_contacts_phone", "phone"),
-        Index("ix_whatsapp_contacts_account", "account_id"),
-        {"extend_existing": True},
-    )
-
-    id = db.Column(db.Integer, primary_key=True)
-    account_id = db.Column(db.Integer, db.ForeignKey("whatsapp_accounts.id", ondelete="CASCADE"), nullable=False)
-    phone = db.Column(db.String(32), nullable=False)  # E.164 format
-    name = db.Column(db.String(255), nullable=True)  # Display name from WhatsApp profile
-    wa_id = db.Column(db.String(64), nullable=False)  # WhatsApp ID
-    labels = db.Column(JSON, nullable=True)  # Tags/labels for segmentation
-    notes = db.Column(db.Text, nullable=True)  # Agent notes
-    last_message_at = db.Column(db.DateTime, nullable=True)  # Last message time
-    total_messages = db.Column(db.Integer, default=0, nullable=False)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-
-    # Relationship
-    account = db.relationship("WhatsAppAccount", backref=db.backref("contacts", lazy="dynamic"))
-
-    def __repr__(self):
-        return f"<WhatsAppContact {self.phone} ({self.name})>"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
-            "account_id": self.account_id,
-            "phone": self.phone,
-            "name": self.name,
-            "wa_id": self.wa_id,
-            "labels": self.labels or [],
-            "notes": self.notes,
-            "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
-            "total_messages": self.total_messages,
+            "workspace_id": self.workspace_id,
+            "media_id": self.media_id,
+            "mime_type": self.mime_type,
+            "sha256": self.sha256,
             "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 

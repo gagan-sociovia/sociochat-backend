@@ -3,7 +3,7 @@ Automation Node Executor
 ========================
 
 Executes individual nodes in a visual automation.
-Handles message sending, delays, buttons, and flows.
+Handles message sending, delays, buttons, flows, and templates.
 
 Works with the ConversationStateEngine to advance conversations.
 """
@@ -16,6 +16,7 @@ import asyncio
 from models import db
 from whatsapp.visual_automation_models import WhatsAppVisualAutomation, WhatsAppConversationState
 from whatsapp.conversation_state_engine import ConversationStateEngine
+from whatsapp.template_node_executor import TemplateNodeExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,8 @@ class NodeExecutor:
         self, 
         workspace_id: str,
         state_engine: ConversationStateEngine,
-        send_message_fn: Callable[[str, str, Dict], Any]
+        send_message_fn: Callable[[str, str, Dict], Any],
+        send_template_fn: Optional[Callable[[str, str, str, list], Any]] = None
     ):
         """
         Initialize the executor.
@@ -43,10 +45,13 @@ class NodeExecutor:
             state_engine: ConversationStateEngine instance
             send_message_fn: Function to send WhatsApp messages
                             Signature: (phone_number, message_type, payload) -> result
+            send_template_fn: Function to send WhatsApp templates
+                            Signature: (phone_number, template_name, language, components) -> result
         """
         self.workspace_id = workspace_id
         self.state_engine = state_engine
         self.send_message = send_message_fn
+        self.send_template_fn = send_template_fn
     
     def execute_node(
         self, 
@@ -74,6 +79,8 @@ class NodeExecutor:
                 return self._execute_message_node(state, node_id, node_data)
             elif node_type == 'buttons':
                 return self._execute_buttons_node(state, node_id, node_data)
+            elif node_type == 'template':
+                return self._execute_template_node(state, node_id, node_data, node)
             elif node_type == 'delay':
                 return self._execute_delay_node(state, node_id, node_data)
             elif node_type == 'flow':
@@ -84,6 +91,15 @@ class NodeExecutor:
                     'success': True,
                     'next_node_id': self._get_next_node_id(state),
                     'wait_for_input': False
+                }
+            elif node_type == 'end':
+                # End nodes complete the automation
+                self.state_engine.complete_automation(state)
+                return {
+                    'success': True,
+                    'next_node_id': None,
+                    'wait_for_input': False,
+                    'completed': True
                 }
             else:
                 logger.warning(f"[Node Executor] Unknown node type: {node_type}")
@@ -199,6 +215,93 @@ class NodeExecutor:
         
         except Exception as e:
             return {'success': False, 'error': str(e)}
+    
+    def _execute_template_node(
+        self, 
+        state: WhatsAppConversationState, 
+        node_id: str, 
+        data: Dict[str, Any],
+        node: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Execute a template node - sends an approved WhatsApp template.
+        
+        Templates can have quick reply buttons that route to other nodes.
+        The button payloads encode the automation_id and target_node_id.
+        """
+        template_name = data.get('templateName', '')
+        
+        if not template_name:
+            return {'success': False, 'error': 'No template selected'}
+        
+        if not self.send_template_fn:
+            return {'success': False, 'error': 'Template sending not configured'}
+        
+        # Note: Templates can be sent outside 24h window, so we don't check it
+        
+        # Get runtime variables from conversation context
+        runtime_variables = self._get_runtime_variables(state)
+        
+        # Create template executor
+        executor = TemplateNodeExecutor(
+            workspace_id=self.workspace_id,
+            account_id=state.automation.account_id if state.automation else 0,
+            send_template_fn=self.send_template_fn
+        )
+        
+        # Execute the template node
+        result = executor.execute_template_node(state, node, runtime_variables)
+        
+        if result.get('success'):
+            logger.info(
+                f"[Automation Source: VISUAL_AUTOMATION] Sent template '{template_name}' "
+                f"to {state.phone_number}"
+            )
+            
+            # If template has routing buttons, stay on this node waiting for click
+            if result.get('wait_for_input'):
+                return {
+                    'success': True,
+                    'next_node_id': None,  # Determined by button click
+                    'wait_for_input': True
+                }
+            else:
+                # No routing buttons, advance to next node
+                next_node_id = self._get_next_node_id(state)
+                if next_node_id:
+                    self.state_engine.advance_to_node(state, next_node_id)
+                return {
+                    'success': True,
+                    'next_node_id': next_node_id,
+                    'wait_for_input': False
+                }
+        
+        return result
+    
+    def _get_runtime_variables(self, state: WhatsAppConversationState) -> Dict[str, Any]:
+        """
+        Get runtime variables for template substitution.
+        
+        These can be used in template variables like {{customer_name}}.
+        """
+        variables = {}
+        
+        # Get state data if any
+        if state.state_data:
+            variables.update(state.state_data)
+        
+        # Try to get conversation/contact info
+        try:
+            from whatsapp.models import WhatsAppConversation
+            conversation = WhatsAppConversation.query.get(state.conversation_id)
+            if conversation:
+                variables['phone_number'] = conversation.phone_number or state.phone_number
+                variables['contact_name'] = conversation.contact_name or ''
+                variables['customer_name'] = conversation.contact_name or ''
+        except Exception as e:
+            logger.warning(f"[Node Executor] Could not get conversation info: {e}")
+        
+        return variables
     
     def _execute_delay_node(
         self, 

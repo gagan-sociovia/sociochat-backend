@@ -17,6 +17,7 @@ from flask import session, request
 from models import db
 from .models import WhatsAppAccount
 from .encryption import encrypt_token
+from .utils import subscribe_waba_to_app
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,6 @@ REQUIRED_SCOPES = [
     "whatsapp_business_messaging",
     "whatsapp_business_management",
     "business_management",
-    "whatsapp_business_manage_events",
 ]
 
 
@@ -263,6 +263,12 @@ def save_whatsapp_account(
     
     logger.info(f"Saved WhatsApp account: WABA {waba_info['waba_id']} for workspace {workspace_id}")
     
+    # Subscribe WABA to app for webhooks (messages, template updates, etc.)
+    try:
+        subscribe_waba_to_app(waba_info["waba_id"], access_token)
+    except Exception as e:
+        logger.warning(f"Initial webhook subscription failed for WABA {waba_info['waba_id']}: {e}")
+    
     # ============================================================
     # AUTOMATIC FLOW ENCRYPTION SETUP
     # ============================================================
@@ -286,25 +292,6 @@ def save_whatsapp_account(
         except Exception as e:
             logger.exception(f"Flow encryption setup failed for WABA {waba_info['waba_id']}: {e}")
             # Don't fail account creation - flow setup can be retried
-    
-    # ============================================================
-    # SUBSCRIBE WABA TO APP WEBHOOKS
-    # ============================================================
-    # Critical: Without this, Meta won't send webhook events (incoming
-    # messages, status updates) to this app for this WABA.
-    try:
-        subscribe_url = f"{META_GRAPH_API}/{waba_info['waba_id']}/subscribed_apps"
-        headers = {"Authorization": f"Bearer {access_token}"}
-        sub_response = requests.post(subscribe_url, headers=headers, timeout=30)
-        sub_data = sub_response.json()
-        
-        if sub_data.get("success"):
-            logger.info(f"WABA {waba_info['waba_id']} subscribed to app webhooks")
-        else:
-            logger.warning(f"WABA webhook subscription failed: {sub_data}")
-    except Exception as e:
-        logger.exception(f"WABA webhook subscription error for {waba_info['waba_id']}: {e}")
-        # Don't fail account creation - subscription can be retried
     
     return account
 

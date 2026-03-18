@@ -76,12 +76,7 @@ def get_account_with_token(account_id: int) -> Tuple[Optional['WhatsAppAccount']
     
     # Check token expiry if available
     if account.token_expires_at:
-        # Ensure account.token_expires_at is timezone-aware for comparison
-        expires_at = account.token_expires_at
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-            
-        if expires_at < datetime.now(timezone.utc):
+        if account.token_expires_at < datetime.now(timezone.utc):
             return None, "Access token has expired. Please reconnect your WhatsApp Business Account."
     
     return account, None
