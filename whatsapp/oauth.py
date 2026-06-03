@@ -147,6 +147,10 @@ def exchange_code_for_token(code: str, state: str) -> Dict[str, Any]:
 def fetch_waba_info(access_token: str) -> Dict[str, Any]:
     """
     Fetch WhatsApp Business Account information from Meta.
+
+    .. deprecated::
+        Superseded by ``meta_asset_discovery.discover_whatsapp_assets()``.
+        Kept for reference only — not used by connect/exchange flows.
     
     Args:
         access_token: Meta access token
@@ -205,6 +209,10 @@ def save_whatsapp_account(
 ) -> WhatsAppAccount:
     """
     Save or update WhatsApp account after OAuth — gated by Tech Provider validation.
+
+    .. deprecated::
+        No route callers — use ``onboarding_service.finalize_whatsapp_connection()`` directly.
+
     ACTIVE is set only when discovery, permissions, and app subscription all pass.
     """
     from .onboarding_service import finalize_whatsapp_connection

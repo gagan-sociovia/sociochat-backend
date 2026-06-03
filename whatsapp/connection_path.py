@@ -203,7 +203,11 @@ def detect_whatsapp_connection_path(workspace_id: str) -> Dict[str, Any]:
     # FAST PATH: Fully onboarded active account
     # ============================================================
     if account and account.phone_number_id and account.get_access_token():
-        onboarding_status = getattr(account, "onboarding_status", None) or "ACTIVE"
+        onboarding_status = getattr(account, "onboarding_status", None)
+        if onboarding_status is None and account.is_active:
+            onboarding_status = "ACTIVE"
+        elif onboarding_status is None:
+            onboarding_status = "PENDING"
         if onboarding_status == "ACTIVE" and account.is_active:
             account_summary = {
                 "id": account.id,

@@ -4797,15 +4797,20 @@ def facebook_oauth_login():
             return jsonify(result), status_code
 
         logger.info(f"No WABA found for user {user_id}, returning token for manual linking")
+        from .onboarding_status import OnboardingStatus, user_message_for_status
+
+        no_waba_status = OnboardingStatus.WABA_NOT_VISIBLE
         return jsonify({
-            "success": True,
+            "success": False,
             "connected": False,
+            "onboarding_status": no_waba_status,
+            "user_message": user_message_for_status(no_waba_status),
             "message": "Authenticated successfully but no WhatsApp Business Account found. Please enter your WABA details manually.",
             "access_token": long_token,
             "expires_in": expires_in,
             "user_id": user_id,
             "scopes": scopes,
-        })
+        }), 422
         
     except Exception as e:
         logger.exception(f"Facebook OAuth Login Error: {e}")
