@@ -413,3 +413,24 @@ def clear_dedup_cache():
     """Clear the deduplication cache (for testing)."""
     global _processed_wamids
     _processed_wamids = set()
+
+
+# ============================================================
+# WABA App Subscription (Tech Provider onboarding Phase 4)
+# ============================================================
+
+def subscribe_waba_to_app(waba_id: str, access_token: str):
+    """
+    Subscribe WABA to this app. Returns (success, message, details).
+    Failures must block onboarding — do not silently continue.
+    """
+    from .health_check import subscribe_waba_to_webhooks
+    return subscribe_waba_to_webhooks(waba_id, access_token)
+
+
+def verify_waba_app_subscription(waba_id: str, access_token: str) -> bool:
+    """Return True if WABA is subscribed to this app."""
+    from .health_check import check_waba_webhook_subscription
+    ok, _, _ = check_waba_webhook_subscription(waba_id, access_token)
+    return ok
+

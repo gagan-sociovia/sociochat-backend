@@ -200,32 +200,68 @@ def detect_whatsapp_connection_path(workspace_id: str) -> Dict[str, Any]:
     ).first()
     
     # ============================================================
-    # FAST PATH: Active account with token + phone → return immediately
-    # No Meta API calls needed — just use what's in the DB.
-    # This is the common case and should be near-instant.
+    # FAST PATH: Fully onboarded active account
     # ============================================================
     if account and account.phone_number_id and account.get_access_token():
-        account_summary = {
-            "id": account.id,
-            "waba_id": account.waba_id,
-            "phone_number": account.display_phone_number,
-            "phone_number_id": account.phone_number_id,
-            "verified_name": account.custom_name or account.verified_name,
-            "display_name_status": None,
-            "quality_rating": account.quality_score,
-            "is_test_number": False,
-            "is_active": account.is_active,
-            "token_type": account.token_type,
-        }
-        return {
-            "status": ConnectionStatus.CONNECTED,
-            "recommended_path": None,
-            "reason": "WhatsApp Business account is fully connected",
-            "account_summary": account_summary,
-            "can_use_embedded_signup": False,
-            "can_use_manual_link": True,
-        }
+        onboarding_status = getattr(account, "onboarding_status", None) or "ACTIVE"
+        if onboarding_status == "ACTIVE" and account.is_active:
+            account_summary = {
+                "id": account.id,
+                "waba_id": account.waba_id,
+                "phone_number": account.display_phone_number,
+                "phone_number_id": account.phone_number_id,
+                "verified_name": account.custom_name or account.verified_name,
+                "display_name_status": None,
+                "quality_rating": account.quality_score,
+                "is_test_number": False,
+                "is_active": account.is_active,
+                "token_type": account.token_type,
+                "onboarding_status": onboarding_status,
+                "onboarding_error": getattr(account, "onboarding_error", None),
+            }
+            return {
+                "status": ConnectionStatus.CONNECTED,
+                "recommended_path": None,
+                "reason": "WhatsApp Business account is fully connected",
+                "account_summary": account_summary,
+                "can_use_embedded_signup": False,
+                "can_use_manual_link": True,
+                "onboarding_status": onboarding_status,
+            }
     
+    # Pending Tech Provider onboarding — surface granular status to frontend
+    pending_account = WhatsAppAccount.query.filter_by(workspace_id=workspace_id).order_by(
+        WhatsAppAccount.id.desc()
+    ).first()
+    if pending_account and getattr(pending_account, "onboarding_status", None):
+        ob_status = pending_account.onboarding_status
+        if ob_status != "ACTIVE":
+            from .onboarding_status import user_message_for_status
+            account_summary = {
+                "id": pending_account.id,
+                "waba_id": pending_account.waba_id,
+                "phone_number": pending_account.display_phone_number,
+                "phone_number_id": pending_account.phone_number_id,
+                "verified_name": pending_account.custom_name or pending_account.verified_name,
+                "display_name_status": None,
+                "quality_rating": pending_account.quality_score,
+                "is_test_number": False,
+                "is_active": pending_account.is_active,
+                "token_type": pending_account.token_type,
+                "onboarding_status": ob_status,
+                "onboarding_error": pending_account.onboarding_error,
+            }
+            conn_status = ConnectionStatus.RELINK_REQUIRED if ob_status == "RECONNECT_REQUIRED" else ConnectionStatus.PARTIAL
+            return {
+                "status": conn_status,
+                "recommended_path": RecommendedPath.EMBEDDED if ob_status != "RECONNECT_REQUIRED" else RecommendedPath.MANUAL,
+                "reason": user_message_for_status(ob_status, pending_account.onboarding_error),
+                "account_summary": account_summary,
+                "can_use_embedded_signup": True,
+                "can_use_manual_link": True,
+                "onboarding_status": ob_status,
+            }
+
     # If no active account, check for inactive ones (user explicitly unlinked)
     if not account:
         account = WhatsAppAccount.query.filter_by(
@@ -421,103 +457,28 @@ def connect_manual(
         if existing_ws != target_ws and not existing_account.is_active:
             logger.info(f"Transferring inactive account from workspace {existing_account.workspace_id} to {workspace_id}")
             existing_account.workspace_id = workspace_id
-        
-        # Case C & D: Account belongs to THIS workspace (active or inactive) - update it
-    
-    if existing_account:
-        # Check if existing token is still valid
-        existing_token = existing_account.get_access_token()
-        if existing_token:
-            existing_token_check = validate_token_with_meta(existing_token)
-            if existing_token_check.get("valid"):
-                # Don't overwrite a working token, but ensure account is active
-                was_reactivated = False
-                if not existing_account.is_active:
-                    existing_account.is_active = True
-                    db.session.commit()
-                    was_reactivated = True
-                    logger.info(f"Re-activated account {existing_account.id} with valid token")
-                else:
-                    logger.info(f"Account already connected with valid token, no update needed")
-                
-                # Always re-subscribe to webhooks (subscription can go stale)
-                try:
-                    setup_result = _run_post_connection_setup(existing_account.id, waba_id, existing_token)
-                    logger.info(f"Webhook re-subscription result: {setup_result}")
-                except Exception as e:
-                    logger.warning(f"Webhook re-subscription warning: {e}")
-                
-                return {
-                    "success": True,
-                    "message": "Account already connected with valid token",
-                    "account": existing_account.to_dict(),
-                    "was_updated": was_reactivated
-                }
-        
-        
-        # Determine token type (test numbers or short tokens are temporary)
-        is_temporary = phone_status.get("is_test_number", False) or len(access_token) < 200
-        token_type = "temporary" if is_temporary else "permanent"
-        
-        # Update existing account with new token
-        existing_account.set_access_token(access_token, token_type)
-        existing_account.is_active = True
-        existing_account.connected_by_user_id = user_id
-        existing_account.last_synced_at = datetime.now(timezone.utc)
-        existing_account.display_phone_number = phone_status.get("display_phone_number")
-        existing_account.verified_name = phone_status.get("verified_name") or existing_account.verified_name
-        existing_account.quality_score = phone_status.get("quality_rating")
-        
-        db.session.commit()
-        
-        logger.info(f"Updated existing WhatsApp account: {existing_account.id}")
-        
-        # Run post-connection setup (webhook subscription, etc.)
-        setup_result = _run_post_connection_setup(existing_account.id, waba_id, access_token)
-        
-        return {
-            "success": True,
-            "message": "Account reconnected successfully",
-            "account": existing_account.to_dict(),
-            "was_updated": True,
-            "setup": setup_result
-        }
-    
-    # Step 5: Create new account
-    new_account = WhatsAppAccount(
-        workspace_id=workspace_id,
-        waba_id=waba_id,
-        phone_number_id=phone_number_id,
-        display_phone_number=phone_status.get("display_phone_number"),
-        verified_name=phone_status.get("verified_name"),
-        quality_score=phone_status.get("quality_rating"),
-        connected_by_user_id=user_id,
-        is_active=True,
-    )
-    
-    # Determine token type (test numbers or short tokens are temporary)
+            db.session.commit()
+
+    from .onboarding_service import finalize_whatsapp_connection
+
     is_temporary = phone_status.get("is_test_number", False) or len(access_token) < 200
     token_type = "temporary" if is_temporary else "permanent"
-    
-    new_account.set_access_token(access_token, token_type)
-    new_account.last_synced_at = datetime.now(timezone.utc)
-    
-    db.session.add(new_account)
-    db.session.commit()
-    
-    logger.info(f"Created new WhatsApp account: {new_account.id} for workspace {workspace_id}")
-    
-    # Step 6: Auto-setup - Subscribe WABA to webhooks
-    setup_result = _run_post_connection_setup(new_account.id, waba_id, access_token)
-    
-    return {
-        "success": True,
-        "message": "Account connected successfully",
-        "account": new_account.to_dict(),
-        "was_updated": False,
-        "is_new": True,
-        "setup": setup_result
-    }
+
+    result = finalize_whatsapp_connection(
+        workspace_id=workspace_id,
+        user_id=user_id,
+        access_token=access_token,
+        session_waba_id=waba_id,
+        session_phone_id=phone_number_id,
+        token_type=token_type,
+    )
+
+    if result.get("success"):
+        result.setdefault("message", "Account connected successfully")
+    else:
+        result.setdefault("error_code", "ONBOARDING_INCOMPLETE")
+
+    return result
 
 
 def _run_post_connection_setup(account_id: int, waba_id: str, access_token: str) -> Dict[str, Any]:

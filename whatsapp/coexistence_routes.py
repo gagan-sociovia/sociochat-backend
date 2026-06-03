@@ -66,124 +66,73 @@ def connect_coexistence():
     
     POST /api/whatsapp/coexistence/connect
     Body: {
+        "code": "...",                  // Embedded Signup auth code (preferred from frontend)
         "waba_id": "...",
         "phone_number_id": "...",
         "workspace_id": "...",
-        "access_token": "...",          // From Embedded Signup
+        "access_token": "...",          // Optional if code provided
         "meta_business_id": "...",      // Optional
-        "display_phone_number": "...",  // Optional
-        "verified_name": "..."          // Optional
     }
     """
-    import requests as http_requests
-    
     data = request.get_json(silent=True) or {}
     waba_id = data.get("waba_id")
     phone_number_id = data.get("phone_number_id")
     workspace_id = data.get("workspace_id")
     access_token = data.get("access_token")
+    code = data.get("code")
     meta_business_id = data.get("meta_business_id")
-    display_phone_number = data.get("display_phone_number")
-    verified_name = data.get("verified_name")
-    
-    if not all([waba_id, phone_number_id, workspace_id, access_token]):
+
+    if not workspace_id:
+        return jsonify({"success": False, "error": "workspace_id is required"}), 400
+
+    if not access_token and not code:
         return jsonify({
             "success": False,
-            "error": "waba_id, phone_number_id, workspace_id, and access_token are required"
+            "error": "code or access_token is required",
         }), 400
-    
+
     try:
-        # Check if phone is already connected to another workspace
-        from .connection_guard import check_phone_available
-        conflict = check_phone_available(phone_number_id, workspace_id)
-        if conflict:
-            return jsonify({
-                "success": False,
-                "error": conflict["error"],
-                "error_code": conflict["error_code"],
-            }), 409
-        
-        # Fetch phone number details if not provided
-        if not display_phone_number or not verified_name:
-            api_version = os.getenv("WHATSAPP_API_VERSION", "v23.0")
-            try:
-                phone_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/{phone_number_id}",
-                    params={
-                        "access_token": access_token,
-                        "fields": "display_phone_number,verified_name,quality_rating",
-                    },
-                    timeout=15,
-                ).json()
-                display_phone_number = display_phone_number or phone_resp.get("display_phone_number")
-                verified_name = verified_name or phone_resp.get("verified_name")
-            except Exception as e:
-                logger.warning(f"Failed to fetch phone details: {e}")
-        
-        # Create or update account with coexistence flag
-        existing = WhatsAppAccount.query.filter_by(phone_number_id=phone_number_id).first()
-        
-        if existing:
-            existing.workspace_id = workspace_id
-            existing.waba_id = waba_id
-            existing.is_coexistence = True
-            existing.meta_business_id = meta_business_id
-            existing.mps_limit = 5  # Coexistence limit
-            existing.sync_status = "idle"
-            existing.is_active = True
-            existing.display_phone_number = display_phone_number
-            existing.verified_name = verified_name
-            existing.coexistence_paired_at = datetime.now(timezone.utc)
-            existing.set_access_token(access_token, token_type="long_lived")
-            account = existing
-        else:
-            account = WhatsAppAccount(
-                workspace_id=workspace_id,
-                waba_id=waba_id,
-                phone_number_id=phone_number_id,
-                display_phone_number=display_phone_number,
-                verified_name=verified_name,
-                is_coexistence=True,
-                meta_business_id=meta_business_id,
-                mps_limit=5,
-                sync_status="idle",
-                is_active=True,
-                coexistence_paired_at=datetime.now(timezone.utc),
-            )
-            account.set_access_token(access_token, token_type="long_lived")
-            db.session.add(account)
-        
-        db.session.commit()
-        
-        # Initialize rate limiter bucket
-        CoexistenceRateLimiter.get_bucket(phone_number_id)
-        
-        # Subscribe to webhooks (important for receiving echoes and history)
-        try:
-            from .connection_path import _run_post_connection_setup
-            setup_result = _run_post_connection_setup(account.id, waba_id, access_token)
-            logger.info(f"Coexistence post-connection setup: {setup_result}")
-        except Exception as e:
-            logger.warning(f"Post-connection setup warning: {e}")
-        
-        logger.info(f"WhatsApp account connected in coexistence mode: {phone_number_id}")
-        
-        return jsonify({
-            "success": True,
-            "message": "WhatsApp Business Account connected in coexistence mode",
-            "account": account.to_dict(),
-            "coexistence": {
-                "mps_limit": 5,
-                "mode": "coexistence",
-                "features": [
-                    "Echo messages from mobile app",
-                    "History sync (up to 180 days)",
-                    "Device activity monitoring",
-                    "5 MPS rate limit",
-                ],
-            },
-        })
-        
+        if code and not access_token:
+            from .oauth import exchange_embedded_signup_code
+            access_token = exchange_embedded_signup_code(code)
+
+        from .onboarding_service import finalize_whatsapp_connection
+
+        result = finalize_whatsapp_connection(
+            workspace_id=workspace_id,
+            user_id=data.get("user_id"),
+            access_token=access_token,
+            session_waba_id=waba_id,
+            session_phone_id=phone_number_id,
+            token_type="long_lived",
+            is_coexistence=True,
+            meta_business_id=meta_business_id,
+            mps_limit=5,
+        )
+
+        if result.get("error_code"):
+            return jsonify(result), 409
+
+        if result.get("success") and result.get("account", {}).get("phone_number_id"):
+            CoexistenceRateLimiter.get_bucket(result["account"]["phone_number_id"])
+
+        payload = dict(result)
+        payload["coexistence"] = {
+            "mps_limit": 5,
+            "mode": "coexistence",
+            "features": [
+                "Echo messages from mobile app",
+                "History sync (up to 180 days)",
+                "Device activity monitoring",
+                "5 MPS rate limit",
+            ],
+        }
+        if result.get("success"):
+            payload["message"] = "WhatsApp Business Account connected in coexistence mode"
+
+        status_code = 200 if result.get("success") else 422
+        return jsonify(payload), status_code
+
     except Exception as e:
         logger.exception(f"Coexistence connection error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500

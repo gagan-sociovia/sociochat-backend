@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: sociochat-backend
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - sociochat-data:/app
+    restart: unless-stopped
+
+volumes:
+  sociochat-data:

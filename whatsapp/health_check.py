@@ -169,15 +169,18 @@ def check_waba_webhook_subscription(waba_id: str, access_token: str) -> Tuple[bo
             apps = data.get("data", [])
             
             if apps:
-                # Check if our app is subscribed
-                app_id = os.getenv("FB_APP_ID")
+                app_id = os.getenv("FB_APP_ID") or os.getenv("META_APP_ID")
                 for app in apps:
-                    if app.get("id") == app_id or app.get("whatsapp_business_api_data"):
-                        return True, "WABA is subscribed to webhooks", {
-                            "subscribed_apps": apps
-                        }
-                
-                return True, "WABA has app subscriptions", {"subscribed_apps": apps}
+                    app_entry_id = str(app.get("id", ""))
+                    if app_id and app_entry_id == str(app_id):
+                        return True, "WABA is subscribed to this app", {"subscribed_apps": apps}
+                    if app.get("whatsapp_business_api_data") and app_id and app_entry_id == str(app_id):
+                        return True, "WABA is subscribed to this app", {"subscribed_apps": apps}
+
+                return False, f"WABA is subscribed to other apps but not app {app_id}", {
+                    "error_code": "WRONG_APP_SUBSCRIPTION",
+                    "subscribed_apps": apps,
+                }
             else:
                 return False, "WABA is NOT subscribed to any webhooks", {
                     "error_code": "NO_SUBSCRIPTION"

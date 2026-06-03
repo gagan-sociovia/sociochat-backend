@@ -346,6 +346,12 @@ class WhatsAppAccount(db.Model):
     coexistence_paired_at = db.Column(db.DateTime, nullable=True)  # When coexistence QR handshake completed
     device_inactive_alert_sent = db.Column(db.Boolean, default=False, nullable=False)  # True if >10 days inactive alert was sent
 
+    # Tech Provider onboarding (Phases 5–11)
+    onboarding_status = db.Column(db.String(32), default="PENDING", nullable=False, index=True)
+    onboarding_error = db.Column(db.Text, nullable=True)
+    last_validation_at = db.Column(db.DateTime, nullable=True)
+    app_subscribed = db.Column(db.Boolean, default=False, nullable=False)
+
     # Metadata
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
@@ -392,6 +398,11 @@ class WhatsAppAccount(db.Model):
             "history_sync_progress": self.history_sync_progress,
             "coexistence_paired_at": self.coexistence_paired_at.isoformat() if self.coexistence_paired_at else None,
             "device_inactive_alert_sent": self.device_inactive_alert_sent,
+            # Tech Provider onboarding
+            "onboarding_status": self.onboarding_status,
+            "onboarding_error": self.onboarding_error,
+            "last_validation_at": self.last_validation_at.isoformat() if self.last_validation_at else None,
+            "app_subscribed": self.app_subscribed,
         }
         
         # Only include token for internal backend use, never expose to frontend

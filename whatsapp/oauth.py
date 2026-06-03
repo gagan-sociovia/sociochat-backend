@@ -204,130 +204,50 @@ def save_whatsapp_account(
     waba_info: Dict[str, Any],
 ) -> WhatsAppAccount:
     """
-    Save or update WhatsApp account in database.
-    
-    ALSO automatically sets up flow encryption:
-    1. Generates RSA key pair
-    2. Saves private key encrypted
-    3. Uploads public key to Meta
-    
-    Args:
-        workspace_id: Workspace ID
-        user_id: User ID who connected
-        access_token: Access token (will be encrypted)
-        token_expires_at: Token expiration
-        waba_info: WABA information from Meta
-        
-    Returns:
-        WhatsAppAccount instance
+    Save or update WhatsApp account after OAuth — gated by Tech Provider validation.
+    ACTIVE is set only when discovery, permissions, and app subscription all pass.
     """
-    # GUARD: Block cross-workspace conflict before saving
-    from .connection_guard import check_phone_available
-    conflict = check_phone_available(waba_info["phone_number_id"], workspace_id)
-    if conflict:
-        raise ValueError(conflict["error"])
-    
-    # Check if account already exists (by phone_number_id globally, not per workspace)
-    account = WhatsAppAccount.query.filter_by(
-        phone_number_id=waba_info["phone_number_id"],
-    ).first()
-    
-    is_new_account = account is None
-    
-    if account:
-        # Update existing account (safe: guard passed above)
-        account.workspace_id = workspace_id
-        account.waba_id = waba_info["waba_id"]
-        account.set_access_token(access_token, "permanent", token_expires_at)
-        account.connected_by_user_id = user_id
-        account.display_phone_number = waba_info.get("display_phone_number")
-        account.verified_name = waba_info.get("waba_name")
-        account.last_synced_at = datetime.now(timezone.utc)
-        account.is_active = True
-    else:
-        # Create new account
-        account = WhatsAppAccount(
-            workspace_id=workspace_id,
-            waba_id=waba_info["waba_id"],
-            phone_number_id=waba_info["phone_number_id"],
-            display_phone_number=waba_info.get("display_phone_number"),
-            verified_name=waba_info.get("waba_name"),
-            connected_by_user_id=user_id,
-            is_active=True,
+    from .onboarding_service import finalize_whatsapp_connection
+
+    result = finalize_whatsapp_connection(
+        workspace_id=workspace_id,
+        user_id=user_id,
+        access_token=access_token,
+        token_expires_at=token_expires_at,
+        session_waba_id=waba_info.get("waba_id"),
+        session_phone_id=waba_info.get("phone_number_id"),
+    )
+
+    if result.get("error_code"):
+        raise ValueError(result["error"])
+
+    account_data = result.get("account")
+    if not account_data:
+        raise ValueError(result.get("error") or result.get("user_message") or "Onboarding validation failed")
+
+    account = WhatsAppAccount.query.get(account_data["id"])
+    if not account:
+        raise ValueError("Account save failed")
+
+    if not result.get("success"):
+        logger.warning(
+            "WhatsApp account saved but not ACTIVE: status=%s error=%s",
+            result.get("onboarding_status"),
+            result.get("onboarding_error"),
         )
-        account.set_access_token(access_token, "permanent", token_expires_at)
-        account.last_synced_at = datetime.now(timezone.utc)
-        db.session.add(account)
-    
-    db.session.commit()
-    
-    logger.info(f"Saved WhatsApp account: WABA {waba_info['waba_id']} for workspace {workspace_id}")
-    
-    # ============================================================
-    # AUTOMATIC FLOW ENCRYPTION SETUP
-    # ============================================================
-    # Only setup flow keys if:
-    # 1. New account OR account doesn't have keys yet
-    # 2. Access token is available
-    
-    if is_new_account or not account.has_flow_keys():
-        try:
-            from .flow_endpoint import setup_flow_encryption_for_account
-            
-            logger.info(f"Setting up flow encryption for WABA {waba_info['waba_id']}")
-            result = setup_flow_encryption_for_account(account)
-            
-            if result.get("success"):
-                logger.info(f"Flow encryption configured for WABA {waba_info['waba_id']}")
-            else:
-                logger.warning(f"Flow encryption setup partial for WABA {waba_info['waba_id']}: {result.get('error')}")
-                # Keys saved but not uploaded - can retry later via /keys/upload
-                
-        except Exception as e:
-            logger.exception(f"Flow encryption setup failed for WABA {waba_info['waba_id']}: {e}")
-            # Don't fail account creation - flow setup can be retried
-    
-    # ============================================================
-    # SUBSCRIBE WABA TO APP WEBHOOKS
-    # ============================================================
-    # Critical: Without this, Meta won't send webhook events (incoming
-    # messages, status updates) to this app for this WABA.
-    try:
-        subscribe_url = f"{META_GRAPH_API}/{waba_info['waba_id']}/subscribed_apps"
-        headers = {"Authorization": f"Bearer {access_token}"}
-        sub_response = requests.post(subscribe_url, headers=headers, timeout=30)
-        sub_data = sub_response.json()
-        
-        if sub_data.get("success"):
-            logger.info(f"WABA {waba_info['waba_id']} subscribed to app webhooks")
-        else:
-            logger.warning(f"WABA webhook subscription failed: {sub_data}")
-    except Exception as e:
-        logger.exception(f"WABA webhook subscription error for {waba_info['waba_id']}: {e}")
-        # Don't fail account creation - subscription can be retried
-    
+
     return account
 
 
 def exchange_short_for_long_token(short_token: str) -> Dict[str, Any]:
     """
     Exchange a short-lived access token from Facebook SDK for a long-lived token.
-    
-    This is used for simple Facebook OAuth login (not Embedded Signup).
-    The short-lived token comes from the FB.login() callback on frontend.
-    
-    Args:
-        short_token: Short-lived access token from Facebook SDK
-        
-    Returns:
-        Dict with long_token, expires_in, token_type
     """
     if not META_APP_ID:
         raise ValueError("META_APP_ID environment variable not set")
     if not META_APP_SECRET:
         raise ValueError("META_APP_SECRET environment variable not set")
-    
-    # Exchange short token for long-lived token
+
     exchange_url = f"{META_GRAPH_API}/oauth/access_token"
     params = {
         "grant_type": "fb_exchange_token",
@@ -335,37 +255,74 @@ def exchange_short_for_long_token(short_token: str) -> Dict[str, Any]:
         "client_secret": META_APP_SECRET,
         "fb_exchange_token": short_token,
     }
-    
+
     response = requests.get(exchange_url, params=params, timeout=30)
-    
+
     if response.status_code != 200:
         error_data = response.json() if response.content else {}
         error_msg = error_data.get("error", {}).get("message", "Token exchange failed")
-        logger.error(f"Facebook token exchange failed: {error_msg}")
+        logger.error("Facebook token exchange failed: %s", error_msg)
         raise ValueError(error_msg)
-    
+
     token_data = response.json()
-    
+
     if "error" in token_data:
         raise ValueError(f"Token exchange failed: {token_data['error']}")
-    
+
     long_token = token_data.get("access_token")
-    expires_in = token_data.get("expires_in")  # Usually 60 days
-    
+    expires_in = token_data.get("expires_in")
+
     if not long_token:
         raise ValueError("No access token in exchange response")
-    
-    # Calculate expiration
+
     expires_at = None
     if expires_in:
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-    
+
     return {
         "access_token": long_token,
         "token_type": token_data.get("token_type", "bearer"),
         "expires_in": expires_in,
         "expires_at": expires_at,
     }
+
+
+def _exchange_code(code: str, *, redirect_uri: Optional[str] = None) -> str:
+    """Exchange OAuth code for short-lived token."""
+    if not META_APP_ID or not META_APP_SECRET:
+        raise ValueError("META_APP_ID and META_APP_SECRET must be set")
+
+    params = {
+        "client_id": META_APP_ID,
+        "client_secret": META_APP_SECRET,
+        "code": code,
+    }
+    if redirect_uri:
+        params["redirect_uri"] = redirect_uri
+
+    response = requests.get(META_TOKEN_EXCHANGE, params=params, timeout=30)
+    token_data = response.json()
+    if response.status_code >= 400 or "error" in token_data:
+        message = token_data.get("error", {}).get("message", "Token exchange failed")
+        raise ValueError(message)
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise ValueError("No access_token in response")
+    return access_token
+
+
+def exchange_embedded_signup_code(code: str) -> str:
+    """Exchange Embedded Signup auth code for a long-lived user access token."""
+    short_token = _exchange_code(code)
+    return exchange_short_for_long_token(short_token)["access_token"]
+
+
+def exchange_oauth_callback_code(code: str, redirect_uri: Optional[str] = None) -> str:
+    """Exchange popup OAuth callback code for a long-lived user access token."""
+    uri = redirect_uri or get_redirect_uri()
+    short_token = _exchange_code(code, redirect_uri=uri)
+    return exchange_short_for_long_token(short_token)["access_token"]
 
 
 def validate_facebook_token(access_token: str) -> Dict[str, Any]:

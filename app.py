@@ -123,6 +123,7 @@ from sms_routes import sms_bp
 app.register_blueprint(sms_bp)
 
 # Register WhatsApp Blueprints
+from whatsapp.onboarding_routes import onboarding_test_bp
 from whatsapp import (
     whatsapp_bp, automation_bp, ai_bp, faq_bp, knowledge_bp,
     template_bp, trigger_bp, drip_bp, interactive_automation_bp,
@@ -146,6 +147,7 @@ app.register_blueprint(flow_testing_bp)
 app.register_blueprint(flow_endpoint_bp)
 app.register_blueprint(dataset_bp, url_prefix="/api/whatsapp")
 app.register_blueprint(coexistence_bp, url_prefix="/api/whatsapp")
+app.register_blueprint(onboarding_test_bp, url_prefix="/api/whatsapp")
 
 # Register Agent Blueprint
 from agent_backend import agent_bp
@@ -183,6 +185,12 @@ with app.app_context():
             logger.info(f"Webhook auto-subscribe complete for {len(accounts)} account(s)")
     except Exception as e:
         logger.warning(f"Webhook auto-subscribe skipped: {e}")
+
+    try:
+        from whatsapp.onboarding_revalidation import init_onboarding_revalidation
+        init_onboarding_revalidation(app)
+    except Exception as e:
+        logger.warning(f"Onboarding revalidation init skipped: {e}")
 
 
 # ---------- Health Check ----------

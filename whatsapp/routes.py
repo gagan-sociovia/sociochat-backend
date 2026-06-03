@@ -29,7 +29,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from urllib.parse import urlencode
-from flask import Blueprint, request, jsonify, g, redirect, current_app
+from flask import Blueprint, request, jsonify, g, redirect, current_app, session
 from sqlalchemy import func, case
 
 from .services import WhatsAppService, ConversationService
@@ -2552,9 +2552,40 @@ def get_conversation_insights(conversation_id: int):
 def health_check():
     """
     Health check endpoint.
-    
+
     GET /api/whatsapp/health
+    GET /api/whatsapp/health?workspace_id=...  — Tech Provider onboarding health
+    GET /api/whatsapp/health?account_id=...    — Tech Provider onboarding health
     """
+    workspace_id = request.args.get("workspace_id")
+    account_id = request.args.get("account_id", type=int)
+
+    if workspace_id or account_id:
+        from .models import WhatsAppAccount
+        from .onboarding_service import build_health_payload, revalidate_account
+
+        if account_id:
+            account = WhatsAppAccount.query.get(account_id)
+        else:
+            account = WhatsAppAccount.query.filter_by(workspace_id=workspace_id).order_by(
+                WhatsAppAccount.id.desc()
+            ).first()
+
+        if not account:
+            return jsonify({
+                "portfolio_visible": False,
+                "waba_visible": False,
+                "phone_visible": False,
+                "app_subscribed": False,
+                "token_valid": False,
+                "permissions_valid": False,
+                "status": "NO_ACCOUNT",
+                "onboarding_error": "No WhatsApp account for this workspace",
+            }), 404
+
+        validation = revalidate_account(account, persist=True)
+        return jsonify(build_health_payload(account, validation))
+
     try:
         token_configured = bool(os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TEMP_TOKEN"))
         phone_configured = bool(os.getenv("WHATSAPP_PHONE_NUMBER_ID"))
@@ -4566,19 +4597,9 @@ def connect_complete():
 
     try:
         service = WhatsAppService(workspace_id=workspace_id)
-        account = service.connect_account(code, workspace_id)
-        
-        return jsonify({
-            "success": True,
-            "account": {
-                "id": account.id,
-                "waba_id": account.waba_id,
-                "phone_number_id": account.phone_number_id,
-                "display_phone_number": account.display_phone_number,
-                "verified_name": account.verified_name,
-                "quality_score": account.quality_score,
-            }
-        })
+        result = service.connect_account(code, workspace_id)
+        status_code = 200 if result.get("success") else 422
+        return jsonify(result), status_code
     except Exception as e:
         logger.exception(f"OAuth Complete Error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -4615,212 +4636,29 @@ def connect_exchange():
     
     app_id = os.getenv("FB_APP_ID") or os.getenv("META_APP_ID")
     app_secret = os.getenv("FB_APP_SECRET") or os.getenv("META_APP_SECRET")
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
     
+    if not app_id or not app_secret:
+        return jsonify({"success": False, "error": "Facebook OAuth not configured (META_APP_ID/SECRET)"}), 500
+
     try:
-        # Exchange code for access token (no redirect_uri needed for Embedded Signup)
-        token_resp = http_requests.get(
-            f"https://graph.facebook.com/{api_version}/oauth/access_token",
-            params={
-                "client_id": app_id,
-                "client_secret": app_secret,
-                "code": code,
-            },
-            timeout=15,
-        ).json()
-        
-        logger.info(f"Token exchange response: {token_resp}")
-        
-        if "error" in token_resp:
-            raise ValueError(f"Token exchange failed: {token_resp['error'].get('message', 'Unknown error')}")
-        
-        access_token = token_resp.get("access_token")
-        if not access_token:
-            raise ValueError("No access_token in response")
-        
-        # Get long-lived token
-        try:
-            long_token_resp = http_requests.get(
-                f"https://graph.facebook.com/{api_version}/oauth/access_token",
-                params={
-                    "grant_type": "fb_exchange_token",
-                    "client_id": app_id,
-                    "client_secret": app_secret,
-                    "fb_exchange_token": access_token,
-                },
-                timeout=15,
-            ).json()
-            if "access_token" in long_token_resp:
-                access_token = long_token_resp["access_token"]
-                logger.info("Got long-lived token")
-        except Exception as e:
-            logger.warning(f"Failed to get long-lived token: {e}")
-        
-        # Get WABA and phone number info
-        # Prefer session info from Embedded Signup postMessage (most reliable)
-        waba_id = session_waba_id
-        phone_number_id = session_phone_id
-        display_phone_number = None
-        verified_name = None
-        
-        # If session info provided both IDs, fetch phone details directly
-        if waba_id and phone_number_id:
-            logger.info(f"Using session info: waba_id={waba_id}, phone_number_id={phone_number_id}")
-            try:
-                phone_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/{phone_number_id}",
-                    params={
-                        "access_token": access_token,
-                        "fields": "display_phone_number,verified_name,quality_rating"
-                    },
-                    timeout=15,
-                ).json()
-                display_phone_number = phone_resp.get("display_phone_number")
-                verified_name = phone_resp.get("verified_name")
-            except Exception as e:
-                logger.warning(f"Failed to fetch phone details for {phone_number_id}: {e}")
-        
-        # Fall back to discovery via /me if session info missing
-        if not waba_id or not phone_number_id:
-            try:
-                me_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/me",
-                    params={
-                        "access_token": access_token,
-                        "fields": "id,name,businesses{id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number,verified_name,quality_rating}}}"
-                    },
-                    timeout=15,
-                ).json()
-                
-                logger.info(f"Me response: {me_resp}")
-                
-                businesses = me_resp.get("businesses", {}).get("data", [])
-                for business in businesses:
-                    wabas = business.get("owned_whatsapp_business_accounts", {}).get("data", [])
-                    for waba in wabas:
-                        waba_id = waba.get("id")
-                        phones = waba.get("phone_numbers", {}).get("data", [])
-                        if phones:
-                            phone = phones[0]
-                            phone_number_id = phone.get("id")
-                            display_phone_number = phone.get("display_phone_number")
-                            verified_name = phone.get("verified_name")
-                        break
-                    if waba_id:
-                        break
-            except Exception as e:
-                logger.warning(f"Failed to get WABA from /me: {e}")
-        
-        # Try debug_token if no WABA found
-        if not waba_id:
-            try:
-                debug_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/debug_token",
-                    params={
-                        "input_token": access_token,
-                        "access_token": f"{app_id}|{app_secret}",
-                    },
-                    timeout=15,
-                ).json()
-                
-                granular_scopes = debug_resp.get("data", {}).get("granular_scopes", [])
-                for scope in granular_scopes:
-                    if scope.get("scope") == "whatsapp_business_management":
-                        target_ids = scope.get("target_ids", [])
-                        if target_ids:
-                            waba_id = target_ids[0]
-                            break
-            except Exception as e:
-                logger.warning(f"Failed to get WABA from debug_token: {e}")
-        
-        # Get phone numbers if we have WABA but no phone
-        if waba_id and not phone_number_id:
-            try:
-                phones_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/{waba_id}/phone_numbers",
-                    params={"access_token": access_token},
-                    timeout=15,
-                ).json()
-                phones = phones_resp.get("data", [])
-                if phones:
-                    phone = phones[0]
-                    phone_number_id = phone.get("id")
-                    display_phone_number = phone.get("display_phone_number")
-                    verified_name = phone.get("verified_name")
-            except Exception as e:
-                logger.warning(f"Failed to fetch phone numbers: {e}")
-        
-        if not waba_id or not phone_number_id:
-            raise ValueError("Could not retrieve WhatsApp Business Account. Make sure you completed the Embedded Signup flow and shared your WhatsApp Business Account.")
-        
-        # GUARD: Block if this phone is active in another workspace
-        from .connection_guard import check_phone_available
-        conflict = check_phone_available(phone_number_id, workspace_id)
-        if conflict:
-            return jsonify({"success": False, "error": conflict["error"], "error_code": conflict["error_code"]}), 409
-        
-        # Save to database
-        existing = WhatsAppAccount.query.filter_by(phone_number_id=phone_number_id).first()
-        
-        if existing:
-            existing.workspace_id = workspace_id
-            existing.set_access_token(access_token, token_type="permanent")
-            existing.is_active = True
-            existing.display_phone_number = display_phone_number
-            existing.verified_name = verified_name
-            account = existing
-        else:
-            account = WhatsAppAccount(
-                workspace_id=workspace_id,
-                waba_id=waba_id,
-                phone_number_id=phone_number_id,
-                display_phone_number=display_phone_number,
-                verified_name=verified_name,
-                is_active=True,
-            )
-            account.set_access_token(access_token, token_type="permanent")
-            get_db().add(account)
-        
-        get_db().commit()
-        
-        logger.info(f"WhatsApp account connected via Embedded Signup: {phone_number_id}")
-        
-        # Auto-register phone number
-        try:
-            register_resp = http_requests.post(
-                f"https://graph.facebook.com/{api_version}/{phone_number_id}/register",
-                json={
-                    "messaging_product": "whatsapp",
-                    "pin": "123456"
-                },
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json"
-                },
-                timeout=15
-            )
-            logger.info(f"Phone registration response: {register_resp.json()}")
-        except Exception as e:
-            logger.warning(f"Phone registration failed (may already be registered): {e}")
-        
-        # Subscribe WABA to app webhooks (critical for receiving incoming messages)
-        try:
-            from .connection_path import _run_post_connection_setup
-            setup_result = _run_post_connection_setup(account.id, waba_id, access_token)
-            logger.info(f"Post-connection setup result: {setup_result}")
-        except Exception as e:
-            logger.warning(f"Post-connection setup warning: {e}")
-        
-        return jsonify({
-            "success": True,
-            "account": {
-                "id": account.id,
-                "waba_id": account.waba_id,
-                "phone_number_id": account.phone_number_id,
-                "display_phone_number": account.display_phone_number,
-                "verified_name": account.verified_name,
-            }
-        })
+        from .oauth import exchange_embedded_signup_code
+        from .onboarding_service import finalize_whatsapp_connection
+
+        access_token = exchange_embedded_signup_code(code)
+        user_id = session.get("user_id") or data.get("user_id")
+        result = finalize_whatsapp_connection(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            access_token=access_token,
+            session_waba_id=session_waba_id,
+            session_phone_id=session_phone_id,
+        )
+
+        if result.get("error_code"):
+            return jsonify(result), 409
+
+        status_code = 200 if result.get("success") else 422
+        return jsonify(result), status_code
         
     except Exception as e:
         logger.exception(f"Embedded Signup Exchange Error: {e}")
@@ -4931,155 +4769,33 @@ def facebook_oauth_login():
         actual_token_type = "long_lived" if expires_in else "permanent"
         
         logger.info(f"Facebook OAuth login successful for user {user_id}, workspace {workspace_id}, token_type={actual_token_type}, expires_in={expires_in}s")
-        
-        # ============================================================
-        # AUTO-DISCOVER WABA AND PHONE NUMBERS
-        # ============================================================
-        waba_id = None
-        phone_number_id = None
-        display_phone_number = None
-        verified_name = None
-        
-        # Method 1: Get from /me with businesses and WABAs
-        try:
-            me_resp = http_requests.get(
-                f"https://graph.facebook.com/{api_version}/me",
-                params={
-                    "access_token": long_token,
-                    "fields": "id,name,businesses{id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number,verified_name,quality_rating}}}"
-                },
-                timeout=15,
-            ).json()
-            
-            logger.info(f"Facebook /me response for WABA discovery: {me_resp}")
-            
-            businesses = me_resp.get("businesses", {}).get("data", [])
-            for business in businesses:
-                wabas = business.get("owned_whatsapp_business_accounts", {}).get("data", [])
-                for waba in wabas:
-                    waba_id = waba.get("id")
-                    phones = waba.get("phone_numbers", {}).get("data", [])
-                    if phones:
-                        phone = phones[0]
-                        phone_number_id = phone.get("id")
-                        display_phone_number = phone.get("display_phone_number")
-                        verified_name = phone.get("verified_name")
-                    break
-                if waba_id:
-                    break
-        except Exception as e:
-            logger.warning(f"Failed to get WABA from /me: {e}")
-        
-        # Method 2: Try debug_token granular_scopes if no WABA found
-        if not waba_id:
-            try:
-                granular_scopes = token_data.get("granular_scopes", [])
-                for scope in granular_scopes:
-                    if scope.get("scope") == "whatsapp_business_management":
-                        target_ids = scope.get("target_ids", [])
-                        if target_ids:
-                            waba_id = target_ids[0]
-                            break
-            except Exception as e:
-                logger.warning(f"Failed to get WABA from debug_token: {e}")
-        
-        # Method 3: Get phone numbers if we have WABA but no phone
-        if waba_id and not phone_number_id:
-            try:
-                phones_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/{waba_id}/phone_numbers",
-                    params={"access_token": long_token},
-                    timeout=15,
-                ).json()
-                phones = phones_resp.get("data", [])
-                if phones:
-                    phone = phones[0]
-                    phone_number_id = phone.get("id")
-                    display_phone_number = phone.get("display_phone_number")
-                    verified_name = phone.get("verified_name")
-            except Exception as e:
-                logger.warning(f"Failed to fetch phone numbers: {e}")
-        
-        # ============================================================
-        # AUTO-CONNECT IF WABA FOUND
-        # ============================================================
-        if waba_id and phone_number_id:
-            # GUARD: Block if this phone is active in another workspace
-            from .connection_guard import check_phone_available
-            conflict = check_phone_available(phone_number_id, workspace_id)
-            if conflict:
-                return jsonify({
-                    "success": False,
-                    "connected": False,
-                    "error": conflict["error"],
-                    "error_code": conflict["error_code"],
-                    "access_token": long_token,
-                    "expires_in": expires_in,
-                }), 409
-            
-            # Save to database
-            existing = WhatsAppAccount.query.filter_by(phone_number_id=phone_number_id).first()
-            
-            if existing:
-                existing.workspace_id = workspace_id
-                existing.set_access_token(long_token, token_type=actual_token_type, expires_at=token_expires_at)
-                existing.is_active = True
-                existing.display_phone_number = display_phone_number
-                existing.verified_name = verified_name
-                existing.connected_by_user_id = user_id
-                account = existing
-            else:
-                account = WhatsAppAccount(
-                    workspace_id=workspace_id,
-                    waba_id=waba_id,
-                    phone_number_id=phone_number_id,
-                    display_phone_number=display_phone_number,
-                    verified_name=verified_name,
-                    connected_by_user_id=user_id,
-                    is_active=True,
-                )
-                account.set_access_token(long_token, token_type=actual_token_type, expires_at=token_expires_at)
-                get_db().add(account)
-            
-            get_db().commit()
-            
-            logger.info(f"WhatsApp account auto-connected via Facebook Login: {phone_number_id} for workspace {workspace_id}")
-            
-            # Auto-register phone number
-            try:
-                register_resp = http_requests.post(
-                    f"https://graph.facebook.com/{api_version}/{phone_number_id}/register",
-                    json={
-                        "messaging_product": "whatsapp",
-                        "pin": "123456"
-                    },
-                    headers={
-                        "Authorization": f"Bearer {long_token}",
-                        "Content-Type": "application/json"
-                    },
-                    timeout=15
-                )
-                logger.info(f"Phone registration response: {register_resp.json()}")
-            except Exception as e:
-                logger.warning(f"Phone registration failed (may already be registered): {e}")
-            
-            return jsonify({
-                "success": True,
-                "connected": True,
-                "message": "WhatsApp account connected successfully!",
-                "account": {
-                    "id": account.id,
-                    "waba_id": account.waba_id,
-                    "phone_number_id": account.phone_number_id,
-                    "display_phone_number": account.display_phone_number,
-                    "verified_name": account.verified_name,
-                },
-                "token_type": actual_token_type,
-                "expires_in": expires_in,
-                "expires_at": token_expires_at.isoformat() if token_expires_at else None,
-            })
-        
-        # No WABA found - return token for manual linking
+
+        from .meta_asset_discovery import discover_whatsapp_assets, resolve_binding_for_auto_connect
+        from .onboarding_service import finalize_whatsapp_connection
+
+        discovery = discover_whatsapp_assets(long_token)
+        binding = resolve_binding_for_auto_connect(discovery)
+
+        if binding.waba_id and binding.phone_number_id:
+            result = finalize_whatsapp_connection(
+                workspace_id=workspace_id,
+                user_id=str(user_id) if user_id else None,
+                access_token=long_token,
+                token_expires_at=token_expires_at,
+                session_waba_id=binding.waba_id,
+                session_phone_id=binding.phone_number_id,
+                token_type=actual_token_type,
+            )
+            result["connected"] = result.get("success", False)
+            result["expires_in"] = expires_in
+            result["expires_at"] = token_expires_at.isoformat() if token_expires_at else None
+            if not result.get("success"):
+                result["access_token"] = long_token
+            status_code = 200 if result.get("success") else 422
+            if result.get("error_code"):
+                status_code = 409
+            return jsonify(result), status_code
+
         logger.info(f"No WABA found for user {user_id}, returning token for manual linking")
         return jsonify({
             "success": True,
@@ -5316,211 +5032,31 @@ def connect_callback():
 
     try:
         # Exchange code for access token
-        app_id = os.getenv("FB_APP_ID")
-        app_secret = os.getenv("FB_APP_SECRET")
-        api_version = os.getenv("FB_API_VERSION", "v22.0")
-        redirect_base = os.getenv("OAUTH_REDIRECT_BASE", "https://sociovia-backend-362038465411.europe-west1.run.app")
+        redirect_base = os.getenv("OAUTH_REDIRECT_BASE") or os.getenv("APP_BASE_URL", "http://localhost:5000")
         redirect_uri = f"{redirect_base.rstrip('/')}/api/whatsapp/connect/callback"
-        
-        import requests as http_requests
-        
-        # Token exchange
-        token_resp = http_requests.get(
-            f"https://graph.facebook.com/{api_version}/oauth/access_token",
-            params={
-                "client_id": app_id,
-                "client_secret": app_secret,
-                "redirect_uri": redirect_uri,
-                "code": code,
-            },
-            timeout=15,
-        ).json()
-        
-        if "error" in token_resp:
-            raise ValueError(f"Token exchange failed: {token_resp['error'].get('message', 'Unknown error')}")
-        
-        access_token = token_resp.get("access_token")
-        if not access_token:
-            raise ValueError("No access_token in response")
-        
-        # Get long-lived token
-        try:
-            long_token_resp = http_requests.get(
-                f"https://graph.facebook.com/{api_version}/oauth/access_token",
-                params={
-                    "grant_type": "fb_exchange_token",
-                    "client_id": app_id,
-                    "client_secret": app_secret,
-                    "fb_exchange_token": access_token,
-                },
-                timeout=15,
-            ).json()
-            access_token = long_token_resp.get("access_token", access_token)
-        except Exception:
-            pass  # Keep short-lived token if exchange fails
-        
-        # Fetch WhatsApp Business Accounts (WABA) using debug_token or /me/businesses
-        waba_id = None
-        phone_number_id = None
-        display_phone_number = None
-        verified_name = None
-        
-        # Try to get WABA from the shared phone number or businesses
-        try:
-            # Method 1: Get businesses and their WhatsApp accounts
-            me_resp = http_requests.get(
-                f"https://graph.facebook.com/{api_version}/me",
-                params={
-                    "access_token": access_token,
-                    "fields": "id,name,businesses{id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number,verified_name,quality_rating}}}"
-                },
-                timeout=15,
-            ).json()
-            
-            # Extract WABA and phone info
-            businesses = me_resp.get("businesses", {}).get("data", [])
-            for business in businesses:
-                wabas = business.get("owned_whatsapp_business_accounts", {}).get("data", [])
-                for waba in wabas:
-                    waba_id = waba.get("id")
-                    phones = waba.get("phone_numbers", {}).get("data", [])
-                    if phones:
-                        phone = phones[0]
-                        phone_number_id = phone.get("id")
-                        display_phone_number = phone.get("display_phone_number")
-                        verified_name = phone.get("verified_name")
-                    break
-                if waba_id:
-                    break
-                    
-        except Exception as e:
-            logger.warning(f"Failed to fetch WABA from businesses: {e}")
-        
-        # If no WABA found, try direct shared WABA ID endpoint
-        if not waba_id:
-            try:
-                shared_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/debug_token",
-                    params={
-                        "input_token": access_token,
-                        "access_token": f"{app_id}|{app_secret}",
-                    },
-                    timeout=15,
-                ).json()
-                
-                granular_scopes = shared_resp.get("data", {}).get("granular_scopes", [])
-                for scope in granular_scopes:
-                    if scope.get("scope") == "whatsapp_business_management":
-                        target_ids = scope.get("target_ids", [])
-                        if target_ids:
-                            waba_id = target_ids[0]
-                            break
-            except Exception as e:
-                logger.warning(f"Failed to get WABA from debug_token: {e}")
-        
-        # If we got a WABA, fetch phone numbers
-        if waba_id and not phone_number_id:
-            try:
-                phones_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/{waba_id}/phone_numbers",
-                    params={"access_token": access_token},
-                    timeout=15,
-                ).json()
-                phones = phones_resp.get("data", [])
-                if phones:
-                    phone = phones[0]
-                    phone_number_id = phone.get("id")
-                    display_phone_number = phone.get("display_phone_number")
-                    verified_name = phone.get("verified_name")
-            except Exception as e:
-                logger.warning(f"Failed to fetch phone numbers: {e}")
-        
-        if not waba_id or not phone_number_id:
-            raise ValueError("Could not retrieve WhatsApp Business Account. Make sure you have a WhatsApp Business Account linked in Meta Business Suite.")
-        
-        # Save to database
-        from .models import WhatsAppAccount
-        from .connection_guard import check_phone_available
-        
-        # GUARD: Block if this phone is active in another workspace
-        conflict = check_phone_available(phone_number_id, workspace_id)
-        if conflict:
-            raise ValueError(conflict["error"])
-        
-        # Check if account already exists
-        existing = WhatsAppAccount.query.filter_by(phone_number_id=phone_number_id).first()
-        
-        if existing:
-            # Update existing account (same workspace, or inactive transfer)
-            existing.workspace_id = workspace_id
-            existing.access_token_encrypted = None  # Will be set below
-            existing.set_access_token(access_token, token_type="permanent")
-            existing.is_active = True
-            existing.display_phone_number = display_phone_number
-            existing.verified_name = verified_name
-            account = existing
-        else:
-            # Create new account
-            account = WhatsAppAccount(
-                workspace_id=workspace_id,
-                waba_id=waba_id,
-                phone_number_id=phone_number_id,
-                display_phone_number=display_phone_number,
-                verified_name=verified_name,
-                is_active=True,
-            )
-            account.set_access_token(access_token, token_type="permanent")
-            get_db().add(account)
-        
-        get_db().commit()
-        
-        logger.info(f"WhatsApp account connected: phone_number_id={account.phone_number_id}")
-        
-        # ============================================================
-        # AUTO-REGISTER PHONE NUMBER WITH WHATSAPP BUSINESS API
-        # This is required before the phone can send/receive messages
-        # ============================================================
-        try:
-            register_resp = http_requests.post(
-                f"https://graph.facebook.com/{api_version}/{phone_number_id}/register",
-                json={
-                    "messaging_product": "whatsapp",
-                    "pin": "123456"  # Default 6-digit PIN for 2FA (user can change later)
-                },
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json"
-                },
-                timeout=15
-            )
-            register_result = register_resp.json()
-            if register_result.get("success"):
-                logger.info(f"Phone number {phone_number_id} registered successfully with WhatsApp Business API")
-            else:
-                # Log but don't fail - phone might already be registered
-                logger.warning(f"Phone registration response: {register_result}")
-        except Exception as reg_error:
-            # Don't fail the OAuth if registration fails - it might already be registered
-            logger.warning(f"Phone registration warning (may already be registered): {reg_error}")
-        
-        # Subscribe WABA to app webhooks (critical for receiving incoming messages)
-        try:
-            from .connection_path import _run_post_connection_setup
-            setup_result = _run_post_connection_setup(account.id, waba_id, access_token)
-            logger.info(f"Post-connection setup (callback) result: {setup_result}")
-        except Exception as e:
-            logger.warning(f"Post-connection setup warning: {e}")
-        
+
+        from .oauth import exchange_oauth_callback_code
+        from .onboarding_service import finalize_whatsapp_connection
+
+        access_token = exchange_oauth_callback_code(code, redirect_uri)
+        result = finalize_whatsapp_connection(
+            workspace_id=workspace_id,
+            user_id=session.get("user_id"),
+            access_token=access_token,
+        )
+
+        if result.get("error_code"):
+            raise ValueError(result.get("error"))
+
         return _render_oauth_response(frontend_url, {
             "type": "sociovia_oauth_complete",
-            "success": True,
-            "account": {
-                "id": account.id,
-                "waba_id": account.waba_id,
-                "phone_number_id": account.phone_number_id,
-                "display_phone_number": account.display_phone_number,
-                "verified_name": account.verified_name,
-            }
+            "success": result.get("success", False),
+            "onboarding_status": result.get("onboarding_status"),
+            "onboarding_error": result.get("onboarding_error"),
+            "user_message": result.get("user_message"),
+            "health": result.get("health"),
+            "account": result.get("account"),
+            "error": result.get("error") if not result.get("success") else None,
         })
     except Exception as e:
         logger.exception(f"OAuth Callback Error: {e}")
